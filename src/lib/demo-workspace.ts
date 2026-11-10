@@ -1,4 +1,6 @@
 import "server-only";
+import { randomUUID } from "node:crypto";
+import { hashPassword } from "better-auth/crypto";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { auth } from "@/lib/auth";
@@ -9,6 +11,10 @@ import { demoSeedConfig } from "@/lib/demo-seed-config";
 import { ConflictError } from "@/lib/errors";
 import { upsertFixtures } from "@/lib/links";
 import { consumeRate } from "@/lib/usage";
+
+/** Postgres unique violation, possibly wrapped by Drizzle (`cause`). */
+const isUniqueViolation = (e: unknown): boolean =>
+  typeof e === "object" && e !== null && ((e as { code?: unknown }).code === "23505" || isUniqueViolation((e as { cause?: unknown }).cause));
 
 const DEMO_EMAIL = `reader@${DEMO_EMAIL_DOMAIN}`;
 
@@ -45,14 +51,28 @@ async function ensureDemoReader(password: string): Promise<Actor> {
   if (existing && existing.image !== MARKER) {
     throw new ConflictError("A demo email belongs to an unrelated account; no demo data was replaced.");
   }
-  const api = auth();
   if (!existing) {
-    const created = await api.api.createUser({
-      body: { email: DEMO_EMAIL, name: "Demo Reader", password, role: "user", data: { image: MARKER } },
-    });
-    return { id: created.user.id, role: "user" };
+    // Written with Drizzle, not Better Auth: the auth hooks refuse demo emails and marker images.
+    const id = randomUUID();
+    try {
+      await db().transaction(async (tx) => {
+        await tx.insert(schema.user).values({ id, email: DEMO_EMAIL, name: "Demo Reader", emailVerified: true, role: "user", image: MARKER });
+        await tx.insert(schema.account).values({
+          id: randomUUID(),
+          accountId: id,
+          providerId: "credential",
+          userId: id,
+          password: await hashPassword(password),
+        });
+      });
+    } catch (e) {
+      // A real account took the demo email since the check above: report a conflict, not a crash.
+      if (isUniqueViolation(e)) throw new ConflictError("A demo email belongs to an unrelated account; no demo data was replaced.");
+      throw e;
+    }
+    return { id, role: "user" };
   }
-  const ctx = await api.$context;
+  const ctx = await auth().$context;
   await ctx.internalAdapter.updatePassword(existing.id, await ctx.password.hash(password));
   await ctx.internalAdapter.deleteUserSessions(existing.id);
   return { id: existing.id, role: "user" };
