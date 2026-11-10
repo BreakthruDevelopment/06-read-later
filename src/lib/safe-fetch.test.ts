@@ -97,7 +97,7 @@ describe("safeFetch (guard against a local server)", () => {
       hits.push(req.url ?? "");
       agents.push(String(req.headers["user-agent"] ?? ""));
       const url = req.url ?? "";
-      if (url === "/png") {
+      if (url.split("?")[0] === "/png") {
         res.writeHead(200, { "content-type": "image/png" });
         return void res.end("not-an-image");
       }
@@ -253,5 +253,128 @@ describe("safeFetch (guard against a local server)", () => {
     expect(page.html).toBe("hello");
     expect(agents[before]).toBe(FETCH_USER_AGENT);
     expect(page.finalUrl).toBe(`${base}/ok`);
+  });
+});
+
+describe("safeFetch (DNS bound, teardown, status before content type)", () => {
+  let server: http.Server;
+  let base: string;
+  const closed = new Set<string>();
+  const sockets = new Set<string>();
+
+  beforeAll(async () => {
+    server = http.createServer((req, res) => {
+      const url = req.url ?? "";
+      sockets.add(url);
+      res.on("close", () => closed.add(url));
+      if (url === "/bad-gzip") {
+        res.writeHead(200, { "content-type": "text/plain", "content-encoding": "gzip" });
+        return void res.write(Buffer.from("this is not gzip data at all, just plain bytes"));
+      }
+      if (url === "/never-ends") {
+        res.writeHead(200, { "content-type": "text/plain" });
+        return void res.write("x".repeat(100));
+      }
+      if (url === "/stalls-after-headers" || url === "/stalls-abort") {
+        res.writeHead(200, { "content-type": "text/plain" });
+        return void res.flushHeaders();
+      }
+      if (url === "/raw-heavy") {
+        // Incompressible bytes in stored blocks: ~1,013 bytes on the wire, 990 after inflating, no Content-Length.
+        const stored = zlib.gzipSync(Buffer.from(Array.from({ length: 990 }, (_, i) => (i * 37 + 11) % 251)), { level: 0 });
+        res.writeHead(200, { "content-type": "text/plain", "content-encoding": "gzip" });
+        res.write(stored.subarray(0, 500));
+        return void setTimeout(() => res.end(stored.subarray(500)), 20);
+      }
+      if (url.startsWith("/status/")) {
+        const status = Number(url.slice("/status/".length));
+        res.writeHead(status, { "content-type": "application/json" });
+        return void res.end('{"error":"nope"}');
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    base = `http://public.test:${(server.address() as AddressInfo).port}`;
+  });
+  afterAll(() => server.close());
+
+  const fetcher = createSafeFetch({
+    resolve: async () => [{ address: "127.0.0.1", family: 4 }],
+    isPublic: (a) => a === "127.0.0.1",
+  });
+  const opts = () => ({ allowedPorts: [Number(new URL(base).port)] });
+  const waitClosed = async (path: string) => {
+    for (let i = 0; i < 100 && !closed.has(path); i++) await new Promise((r) => setTimeout(r, 20));
+    return closed.has(path);
+  };
+
+  it("a resolver that never answers fails with timeout at the deadline", async () => {
+    const hung = createSafeFetch({ resolve: () => new Promise(() => {}) });
+    const started = Date.now();
+    expect(await code(hung("http://slow-dns.test/", { timeoutMs: 150 }))).toBe("timeout");
+    expect(Date.now() - started).toBeLessThan(1_500);
+  });
+
+  it("a resolver that never answers stops when the caller signal aborts, and an already-aborted signal never resolves", async () => {
+    const hung = createSafeFetch({ resolve: () => new Promise(() => {}) });
+    const controller = new AbortController();
+    const pending = hung("http://slow-dns.test/", { timeoutMs: 30_000, signal: controller.signal });
+    setTimeout(() => controller.abort(), 30);
+    const started = Date.now();
+    expect(await code(pending)).toBe("timeout");
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(await code(hung("http://slow-dns.test/", { signal: AbortSignal.abort() }))).toBe("timeout");
+  });
+
+  it("a resolver that rejects late still maps to dns, and a late rejection after the deadline is not unhandled", async () => {
+    const failing = createSafeFetch({ resolve: async () => Promise.reject(new Error("ENOTFOUND")) });
+    expect(await code(failing("http://nx.test/"))).toBe("dns");
+    const late = createSafeFetch({ resolve: () => new Promise((_, reject) => setTimeout(() => reject(new Error("late")), 120)) });
+    expect(await code(late("http://late.test/", { timeoutMs: 40 }))).toBe("timeout");
+    await new Promise((r) => setTimeout(r, 200));
+  });
+
+  it("closes the connection when decompression fails", async () => {
+    expect(await code(fetcher(`${base}/bad-gzip`, opts()))).toBe("network");
+    expect(await waitClosed("/bad-gzip")).toBe(true);
+  });
+
+  it("closes the connection on the size cap, on a timeout after headers, and on abort", async () => {
+    expect(await code(fetcher(`${base}/never-ends`, { ...opts(), maxBytes: 50 }))).toBe("too_large");
+    expect(await waitClosed("/never-ends")).toBe(true);
+
+    expect(await code(fetcher(`${base}/stalls-after-headers`, { ...opts(), timeoutMs: 200 }))).toBe("timeout");
+    expect(await waitClosed("/stalls-after-headers")).toBe(true);
+
+    const controller = new AbortController();
+    const pending = fetcher(`${base}/stalls-abort`, { ...opts(), timeoutMs: 10_000, signal: controller.signal });
+    setTimeout(() => controller.abort(), 100);
+    expect(await code(pending)).toBe("timeout");
+    expect(await waitClosed("/stalls-abort")).toBe(true);
+  });
+
+  it("caps the compressed bytes on the wire as well as the decompressed size", async () => {
+    expect(await code(fetcher(`${base}/raw-heavy`, { ...opts(), maxBytes: 1_000 }))).toBe("too_large");
+    const res = await fetcher(`${base}/raw-heavy`, { ...opts(), maxBytes: 2_000 });
+    expect(res.body.length).toBe(990);
+  });
+
+  it.each([429, 500, 502, 503, 404])("judges status %i before the content type", async (status) => {
+    const res = await fetcher(`${base}/status/${status}`, { ...opts(), allowedContentTypes: ["text/html", "text/plain"] });
+    expect(res.status).toBe(status);
+    expect(res.body.length).toBe(0);
+  });
+
+  it("a 200 of the wrong type is still bad_content_type", async () => {
+    // Same JSON body, but success: handled by the existing /png case; here confirm a 2xx JSON is refused too.
+    const ok = createSafeFetch({ resolve: async () => [{ address: "127.0.0.1", family: 4 }], isPublic: () => true });
+    const s2 = http.createServer((_req, res) => res.writeHead(200, { "content-type": "application/json" }).end("{}"));
+    await new Promise<void>((r) => s2.listen(0, "127.0.0.1", r));
+    try {
+      const port = (s2.address() as AddressInfo).port;
+      expect(await code(ok(`http://j.test:${port}/`, { allowedPorts: [port], allowedContentTypes: ["text/html"] }))).toBe("bad_content_type");
+    } finally {
+      s2.close();
+    }
   });
 });

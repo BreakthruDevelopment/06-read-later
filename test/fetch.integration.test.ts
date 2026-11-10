@@ -240,6 +240,79 @@ describe.skipIf(!url)("fetch pipeline (Postgres)", () => {
     expect(JSON.stringify(link.content)).toContain("without reading the whole table");
   });
 
+  const linkRow = async (id: string) => (await sql`select status, fail_code from link where id = ${id}`)[0];
+
+  it("fails a link permanently as too_complex for a deeply nested page, quickly", async () => {
+    const saved = await save("https://nested.ft.example/deep");
+    const bomb = "<div>".repeat(60_000) + "text" + "</div>".repeat(60_000);
+    const handler = run.createFetchHandler({
+      fetch: async (input) => ({ ...htmlResult(input), body: Buffer.from(bomb) }),
+    });
+    const row = await jobFor(saved.link.id);
+    const started = Date.now();
+    await worker.createWorker({ handlers: { fetch: handler }, concurrency: 1 }).kick({ ids: [row.id] });
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(await jobFor(saved.link.id)).toMatchObject({ status: "failed", attempts: 1, last_error: "too_complex" });
+    expect(await linkRow(saved.link.id)).toMatchObject({ status: "failed", fail_code: "too_complex" });
+  });
+
+  it("marks the link failed when the worker is killed on the last attempt", async () => {
+    const saved = await save("https://killed.ft.example/last");
+    const row = await jobFor(saved.link.id);
+    await sql`update job set attempts = max_attempts - 1 where id = ${row.id}`;
+    const claimed = (await jobs.claim(db, { kinds: ["fetch"], limit: 1, leaseMs: 60_000, ids: [row.id] }))[0];
+    expect(claimed.attempts).toBe(claimed.maxAttempts);
+    await sql`update link set status = 'fetching' where id = ${saved.link.id}`; // what the dead process left behind
+    await sql`update job set locked_until = now() - interval '1 second' where id = ${row.id}`;
+    const never = run.createFetchHandler({
+      fetch: async () => {
+        throw new Error("must not run again");
+      },
+    });
+    const w = worker.createWorker({ handlers: { fetch: never }, onGiveUp: { fetch: run.giveUpFetch }, intervalMs: 60_000, concurrency: 1 });
+    w.start();
+    try {
+      for (let i = 0; i < 100 && (await linkRow(saved.link.id)).status !== "failed"; i++) await new Promise((r) => setTimeout(r, 50));
+    } finally {
+      await w.stop();
+    }
+    expect(await jobFor(saved.link.id)).toMatchObject({ status: "failed", last_error: "lease_expired" });
+    expect(await linkRow(saved.link.id)).toMatchObject({ status: "failed", fail_code: "lease_expired" });
+  });
+
+  it("marks the link failed when a deferral is the final outcome, and keeps it queued while retries remain", async () => {
+    const saved = await save("https://deferred.ft.example/busy");
+    const row = await jobFor(saved.link.id);
+    const handler = run.createFetchHandler({
+      fetch: async () => {
+        throw new Error("must not fetch while the host is busy");
+      },
+    });
+    const hooks = { fetch: run.giveUpFetch };
+    const lease = await host.claimHost("deferred.ft.example");
+    expect(lease).toBeTruthy();
+    // Retries remain: the deferral is not a failure, and the link stays queued.
+    await worker.createWorker({ handlers: { fetch: handler }, onGiveUp: hooks, concurrency: 1 }).kick({ ids: [row.id] });
+    expect(await jobFor(saved.link.id)).toMatchObject({ status: "queued", last_error: "host_busy" });
+    expect(await linkRow(saved.link.id)).toMatchObject({ status: "queued", fail_code: null });
+    // Deferrals and attempts both used up: the next deferral ends the job, and the link needs a Retry button.
+    await sql`update job set run_after = now() - interval '1 second', attempts = max_attempts - 1, deferrals = 20 where id = ${row.id}`;
+    await worker.createWorker({ handlers: { fetch: handler }, onGiveUp: hooks, concurrency: 1 }).kick({ ids: [row.id] });
+    expect(await jobFor(saved.link.id)).toMatchObject({ status: "failed", last_error: "host_busy" });
+    expect(await linkRow(saved.link.id)).toMatchObject({ status: "failed", fail_code: "host_busy" });
+    await host.releaseHost("deferred.ft.example", lease!);
+  });
+
+  it("does not overwrite a link that finished or already failed with a specific code", async () => {
+    const saved = await save("https://specific.ft.example/page");
+    await sql`update link set status = 'failed', fail_code = 'http_4xx' where id = ${saved.link.id}`;
+    await run.giveUpFetch({ id: "x", kind: "fetch", key: saved.link.id, ownerId: owner.id, payload: {} }, "lease_expired");
+    expect(await linkRow(saved.link.id)).toMatchObject({ status: "failed", fail_code: "http_4xx" });
+    await sql`update link set status = 'extracted', fail_code = null where id = ${saved.link.id}`;
+    await run.giveUpFetch({ id: "x", kind: "fetch", key: saved.link.id, ownerId: owner.id, payload: {} }, "lease_expired");
+    expect(await linkRow(saved.link.id)).toMatchObject({ status: "extracted" });
+  });
+
   it("runs one of two same-host jobs and spaces the other", async () => {
     const first = await save("https://spacing.ft.example/one");
     const second = await save("https://spacing.ft.example/two");

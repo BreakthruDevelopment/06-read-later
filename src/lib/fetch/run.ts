@@ -13,7 +13,7 @@ import { SafeFetchError } from "@/lib/safe-fetch";
 import { safeErrorFields } from "@/lib/safe-error";
 import { releaseDaily, reserveDaily } from "@/lib/usage";
 import { enqueue } from "@/lib/jobs/queue";
-import { JobError, type JobContext, type JobHandler, type JobInfo } from "@/lib/jobs/worker";
+import { JobError, type JobContext, type JobGiveUp, type JobHandler, type JobInfo } from "@/lib/jobs/worker";
 
 const { link } = schema;
 
@@ -35,6 +35,21 @@ export function createFetchHandler(deps: FetchDeps = {}): JobHandler {
 }
 
 export const fetchLinkHandler = createFetchHandler();
+
+/**
+ * The fetch job is out of attempts, out of deferrals, or its worker was killed on the last attempt. The handler never
+ * got to mark the link, so do it here: `failed` with a code puts the Retry button on the card. A link the handler
+ * already failed with a more specific code, or one that finished, is left alone.
+ */
+export const giveUpFetch: JobGiveUp = async (job, code) => {
+  const linkId = linkIdOf(job);
+  if (!linkId || !job.ownerId) return;
+  const safe = /^[a-z0-9_]{1,40}$/.test(code) ? code : "error";
+  await db()
+    .update(link)
+    .set({ status: "failed", failCode: safe, updatedAt: sql`now()` })
+    .where(and(eq(link.id, linkId), eq(link.ownerId, job.ownerId), sql`${link.status} in ('queued', 'fetching')`));
+};
 
 /**
  * Fetch one saved link and store plain paragraphs. Idempotent: a job can run twice after a crash.
@@ -81,7 +96,7 @@ async function runFetch(job: JobInfo, ctx: JobContext, deps: FetchDeps): Promise
     if (ctx.signal.aborted) throw new JobError("timeout");
     assertHttp(page.status);
     const extracted = extractHtml(page.html);
-    if (!extracted.ok) throw new JobError("no_text", { permanent: true });
+    if (!extracted.ok) throw new JobError(extracted.code, { permanent: true });
     if (ctx.signal.aborted) throw new JobError("timeout");
 
     const saved = await storeExtracted(row, extracted.page, page.finalUrl);

@@ -8,9 +8,9 @@ afterEach(() => {
   startWorker.mockClear();
 });
 
-async function load(handlers: Record<string, unknown>) {
+async function load(handlers: Record<string, unknown>, onGiveUp: Record<string, unknown> = {}) {
   vi.doMock("./worker", () => ({ startWorker }));
-  vi.doMock("./handlers", () => ({ handlers }));
+  vi.doMock("./handlers", () => ({ handlers, onGiveUp }));
   return (await import("./start")).startJobs();
 }
 
@@ -22,7 +22,8 @@ describe("startJobs (called from instrumentation.ts)", () => {
 
   it("starts the worker with the registered handlers", async () => {
     const handler = async () => {};
-    expect(await load({ "fetch-link": handler })).toBe(true);
-    expect(startWorker).toHaveBeenCalledWith({ handlers: { "fetch-link": handler } });
+    const hook = async () => {};
+    expect(await load({ "fetch-link": handler }, { "fetch-link": hook })).toBe(true);
+    expect(startWorker).toHaveBeenCalledWith({ handlers: { "fetch-link": handler }, onGiveUp: { "fetch-link": hook } });
   });
 });

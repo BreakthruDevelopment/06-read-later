@@ -16,8 +16,11 @@ import { isPublicIp } from "@/lib/ip-guard";
  * - blocked names (`localhost`, `*.local`, `*.internal`, `*.azurecontainerapps.io`) and non-public IP literals
  *   are refused before any DNS or connection;
  * - redirects are followed by hand (max `maxRedirects`), and every hop is checked from scratch;
- * - the body is capped at `maxBytes`, counted after gzip/deflate/brotli decompression;
- * - one deadline, `timeoutMs`, covers every hop and the whole body. Optional `connectTimeoutMs` and
+ * - the body is capped at `maxBytes` after gzip/deflate/brotli decompression, and the compressed bytes on the wire
+ *   are capped at `maxBytes` too;
+ * - a non-2xx status is judged before the content type, so a 429 or 5xx page of any type stays retryable;
+ * - every failure (timeout, abort, size cap, decompression error) destroys the response, the decoder and the request;
+ * - one deadline, `timeoutMs`, covers DNS, every hop and the whole body. Optional `connectTimeoutMs` and
  *   `headersTimeoutMs` are tighter caps on those phases.
  * No cookies, authorization or proxy are ever used. Errors carry a fixed message and a `code` only, never the URL
  * or any response content.
@@ -69,10 +72,11 @@ export function createSafeFetch(deps: Deps = {}) {
   const isPublic = deps.isPublic ?? isPublicIp;
   const resolve: Resolve = deps.resolve ?? ((host) => dns.promises.lookup(host, { all: true, verbatim: true }));
 
-  async function pinHost(host: string): Promise<Pin> {
+  async function pinHost(host: string, deadline: number, signal: AbortSignal | undefined): Promise<Pin> {
     let addresses: { address: string; family: number }[];
     try {
-      addresses = await resolve(host);
+      // A resolver that never answers must not outlive the deadline or the abort signal.
+      addresses = await within(resolve(host), deadline, signal);
     } catch (err) {
       if (err instanceof SafeFetchError) throw err;
       throw new SafeFetchError("dns");
@@ -107,19 +111,29 @@ export function createSafeFetch(deps: Deps = {}) {
         signal?.removeEventListener("abort", onAbort);
         fn();
       };
-      const fail = (err: SafeFetchError) => done(() => reject(err));
+      let response: http.IncomingMessage | undefined;
+      let decoder: Readable | undefined;
+      // Close everything this hop opened. Every failure path goes through here, so a stalled or hostile server
+      // cannot keep a socket (or a half-open decompressor) alive after we gave up.
+      const teardown = () => {
+        for (const stream of [decoder, response]) {
+          if (!stream) continue;
+          stream.on("error", () => {});
+          stream.destroy();
+        }
+        req.destroy();
+      };
+      const fail = (err: SafeFetchError) =>
+        done(() => {
+          teardown();
+          reject(err);
+        });
       const arm = (ms: number) => {
         if (timer) clearTimeout(timer);
-        timer = setTimeout(() => {
-          req.destroy();
-          fail(new SafeFetchError("timeout"));
-        }, Math.max(1, ms));
+        timer = setTimeout(() => fail(new SafeFetchError("timeout")), Math.max(1, ms));
         timer.unref?.();
       };
-      const onAbort = () => {
-        req.destroy();
-        fail(new SafeFetchError("timeout"));
-      };
+      const onAbort = () => fail(new SafeFetchError("timeout"));
 
       const lookup: LookupFunction = (_hostname, options, callback) => {
         if (!pin) {
@@ -148,33 +162,34 @@ export function createSafeFetch(deps: Deps = {}) {
           agent: false,
         },
         (res) => {
+          response = res;
           arm(Math.max(1, deadline - Date.now()));
           const status = res.statusCode ?? 0;
           const out: Record<string, string> = {};
           for (const [key, value] of Object.entries(res.headers)) {
             if (value !== undefined) out[key] = Array.isArray(value) ? value.join(", ") : value;
           }
-          const stop = () => {
-            res.on("error", () => {});
-            res.destroy();
-            req.destroy();
-          };
           if (REDIRECTS.has(status)) {
-            stop();
-            return done(() => resolveHop({ status, headers: out, body: Buffer.alloc(0) }));
+            return done(() => {
+              teardown();
+              resolveHop({ status, headers: out, body: Buffer.alloc(0) });
+            });
           }
           if (allowedContentTypes && !allowedContentTypes.includes(mediaType(out["content-type"]))) {
-            stop();
-            return fail(new SafeFetchError("bad_content_type"));
+            // Judge the status first. Only a successful response of the wrong type is a permanent mistake; a 429,
+            // a 5xx or a 4xx error page (often text/plain or JSON) is reported by status so the caller can retry.
+            if (status >= 200 && status < 300) return fail(new SafeFetchError("bad_content_type"));
+            return done(() => {
+              teardown();
+              resolveHop({ status, headers: out, body: Buffer.alloc(0) });
+            });
           }
           const encoding = (out["content-encoding"] ?? "").trim().toLowerCase();
-          const compressed = encoding !== "" && encoding !== "identity";
           const declared = Number(out["content-length"]);
-          if (!compressed && Number.isFinite(declared) && declared > maxBytes) {
-            stop();
-            return fail(new SafeFetchError("too_large"));
-          }
+          // Content-Length is the compressed size when an encoding is used, so it is checked against the raw cap.
+          if (Number.isFinite(declared) && declared > maxBytes) return fail(new SafeFetchError("too_large"));
           const decoded = decodedBody(res, encoding);
+          decoder = decoded;
           const chunks: Buffer[] = [];
           let total = 0;
           // Attach the error handler before reading. Destroying an over-cap stream emits `error` synchronously,
@@ -183,12 +198,17 @@ export function createSafeFetch(deps: Deps = {}) {
           decoded.on("error", onStreamError);
           if (decoded !== res) res.on("error", onStreamError);
           res.on("aborted", onStreamError);
+          if (decoded !== res) {
+            let raw = 0;
+            res.on("data", (chunk: Buffer) => {
+              raw += chunk.length;
+              if (raw > maxBytes) fail(new SafeFetchError("too_large"));
+            });
+          }
           decoded.on("data", (chunk: Buffer) => {
             total += chunk.length;
             if (total > maxBytes) {
               fail(new SafeFetchError("too_large"));
-              decoded.destroy();
-              req.destroy();
               return;
             }
             chunks.push(chunk);
@@ -226,7 +246,7 @@ export function createSafeFetch(deps: Deps = {}) {
       if (opts.signal?.aborted) throw new SafeFetchError("timeout");
       const host = bareHost(url);
       vet(url, host, ports, isPublic);
-      const pin = isIP(host) ? null : await pinHost(host);
+      const pin = isIP(host) ? null : await pinHost(host, deadline, opts.signal);
       const res = await hop(
         url,
         opts.headers ?? {},
@@ -244,6 +264,26 @@ export function createSafeFetch(deps: Deps = {}) {
       url = parse(location, url);
     }
   };
+}
+
+/** Reject with `timeout` when the deadline passes or the signal aborts first. The losing promise is left to settle quietly. */
+function within<T>(work: Promise<T>, deadline: number, signal: AbortSignal | undefined): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => onAbort(), Math.max(1, deadline - Date.now()));
+    timer.unref?.();
+    const finish = (fn: () => void) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      fn();
+    };
+    const onAbort = () => finish(() => reject(new SafeFetchError("timeout")));
+    if (signal?.aborted) return onAbort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (value) => finish(() => resolve(value)),
+      (err: unknown) => finish(() => reject(err)),
+    );
+  });
 }
 
 function parse(input: string, base?: URL): URL {

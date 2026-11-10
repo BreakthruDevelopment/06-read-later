@@ -19,7 +19,11 @@ export type ExtractedPage = {
   wordCount: number;
 };
 
-export type ExtractResult = { ok: true; page: ExtractedPage } | { ok: false; code: "no_text" };
+export type ExtractResult = { ok: true; page: ExtractedPage } | { ok: false; code: "no_text" | "too_complex" };
+
+/** Readability and linkedom run on the event loop and grow worse than linearly with nesting, so bound the input. */
+export const MAX_DEPTH = 500;
+export const MAX_ELEMENTS = 20_000;
 
 type Article = {
   title?: string | null;
@@ -46,7 +50,12 @@ export function decodePage(body: Buffer, contentType: string | undefined): strin
  * with the tags stripped is used, and under 200 characters of that is `no_text`. Output is capped at 100 KB.
  */
 export function extractHtml(html: string): ExtractResult {
-  const article = readArticle(html);
+  // Cheap linear scan of the raw markup first: parsing 60,000 nested divs already takes seconds, and Readability
+  // on the result takes minutes, all synchronously.
+  if (!withinLimits(html)) return { ok: false, code: "too_complex" };
+  const parsed = parseBounded(html);
+  if (parsed === "too_complex") return { ok: false, code: "too_complex" };
+  const article = readArticle(parsed);
   const readable = article && clean(article.textContent ?? "").length > 0 ? article : null;
   if (readable) {
     const fromContent = readable.content ? paragraphsIn(dom(`<article>${readable.content}</article>`)) : [];
@@ -114,13 +123,82 @@ function finish(
   };
 }
 
-function readArticle(html: string): Article | null {
+function readArticle(document: Document | null): Article | null {
+  if (!document) return null;
   try {
-    const document = dom(html);
-    return new Readability(document, { charThreshold: 0, maxElemsToParse: 50_000 }).parse();
+    return new Readability(document, { charThreshold: 0, maxElemsToParse: MAX_ELEMENTS }).parse();
   } catch {
     return null;
   }
+}
+
+const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
+const RAW_TEXT = new Set(["script", "style", "textarea", "title"]);
+const RAW_CLOSE: Record<string, RegExp> = Object.fromEntries([...RAW_TEXT].map((name) => [name, new RegExp(`</${name}`, "gi")]));
+const OPEN_END = /[^>]{0,4096}>/y;
+const TAG = /<(\/?)([a-zA-Z][a-zA-Z0-9:-]*)|<!--/g;
+
+/**
+ * True when the markup has at most MAX_ELEMENTS tags and nests no deeper than MAX_DEPTH, judged by a single pass
+ * that never builds a tree. Script and style bodies and comments are skipped, so markup inside them is not counted.
+ */
+export function withinLimits(html: string): boolean {
+  let depth = 0;
+  let count = 0;
+  TAG.lastIndex = 0;
+  for (let m = TAG.exec(html); m; m = TAG.exec(html)) {
+    if (m[0] === "<!--") {
+      const end = html.indexOf("-->", TAG.lastIndex);
+      if (end < 0) return true;
+      TAG.lastIndex = end + 3;
+      continue;
+    }
+    const name = m[2].toLowerCase();
+    if (m[1]) {
+      if (depth > 0) depth -= 1;
+      continue;
+    }
+    if (VOID.has(name)) continue;
+    count += 1;
+    if (count > MAX_ELEMENTS) return false;
+    if (RAW_TEXT.has(name)) {
+      const close = RAW_CLOSE[name];
+      close.lastIndex = TAG.lastIndex;
+      const end = close.exec(html);
+      if (!end) return true;
+      TAG.lastIndex = end.index;
+      continue;
+    }
+    // Bounded lookahead: a self-closing `<path/>` opens nothing. Never scan further than one tag's worth.
+    OPEN_END.lastIndex = TAG.lastIndex;
+    if (OPEN_END.exec(html)?.[0].endsWith("/>")) continue;
+    depth += 1;
+    if (depth > MAX_DEPTH) return false;
+  }
+  return true;
+}
+
+/** Parse, then confirm on the real tree (the parser can nest more than the source suggests). Iterative: no recursion. */
+function parseBounded(html: string): Document | "too_complex" | null {
+  let document: Document;
+  try {
+    document = dom(html);
+  } catch {
+    return null;
+  }
+  const root = document.documentElement;
+  if (!root) return document;
+  let count = 0;
+  const stack: { node: Element; depth: number }[] = [{ node: root, depth: 1 }];
+  while (stack.length > 0) {
+    const { node, depth } = stack.pop() as { node: Element; depth: number };
+    count += 1;
+    if (count > MAX_ELEMENTS || depth > MAX_DEPTH) return "too_complex";
+    for (let child = node.firstElementChild; child; child = child.nextElementSibling) {
+      stack.push({ node: child, depth: depth + 1 });
+    }
+  }
+  return document;
 }
 
 function titleTag(html: string): string | null {

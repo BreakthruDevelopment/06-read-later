@@ -13,14 +13,10 @@ export async function register() {
     const { migrateOnStart } = await import("./lib/db/migrate-on-start");
     await migrateOnStart();
   }
-  const { migrationState } = await import("./lib/db/migrate-on-start");
+  // Not awaited: while migrations retry in the background the server must still start.
   const { startJobs } = await import("./lib/jobs/start");
-  const state = migrationState();
-  // Migrations still retrying in the background: don't block startup (health stays 503). The worker
-  // starts once they succeed. Otherwise start now.
-  if (state === "running" || state === "retrying") {
-    void startJobs();
-    return;
-  }
-  await startJobs();
+  startJobs().catch(async (err) => {
+    const [{ log }, { safeErrorFields }] = await Promise.all([import("./lib/log"), import("./lib/safe-error")]);
+    log.error("jobs.start_failed", safeErrorFields(err));
+  });
 }
