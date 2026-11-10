@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { capParagraphs, decodePage, extractHtml, MAX_DEPTH, MAX_ELEMENTS, MAX_TEXT_BYTES, withinLimits } from "@/lib/fetch/extract";
+import { capParagraphs, decodePage, extractHtml, extractPlainText, MAX_DEPTH, MAX_ELEMENTS, MAX_TEXT_BYTES, withinLimits } from "@/lib/fetch/extract";
 
 const CANARY = "SCRIPT_CANARY_TOKEN";
 
@@ -107,5 +107,35 @@ describe("extractHtml limits", () => {
     expect(withinLimits("<!--" + "<div>".repeat(MAX_DEPTH + 10) + "--><p>ok</p>")).toBe(true);
     expect(withinLimits("<svg>" + '<path d="M0 0"/>'.repeat(MAX_DEPTH + 10) + "</svg>")).toBe(true);
     expect(withinLimits("<ul>" + "<li>a<br>b</li>".repeat(1000) + "</ul>")).toBe(true);
+  });
+});
+
+describe("extractPlainText", () => {
+  const prose = [
+    "Plain text files have no markup, so the first paragraph is simply the text up to the first blank line.",
+    "The second paragraph follows a blank line that carries a few spaces.",
+    "A third block, written with Windows line endings, closes the file with enough words to pass the minimum.",
+  ];
+
+  it("splits prose on blank lines into paragraphs", () => {
+    const text = `${prose[0]}\nstill the first paragraph\n\n${prose[1]}\n   \n${prose[2]}\r\n\r\n`;
+    const result = extractPlainText(text);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.page.paragraphs).toEqual([`${prose[0]} still the first paragraph`, prose[1], prose[2]]);
+    expect(result.page.wordCount).toBeGreaterThan(30);
+    expect(result.page.excerpt.length).toBeLessThanOrEqual(300);
+  });
+
+  it("caps stored text at 100 KB and returns no_text for a few words", () => {
+    const big = extractPlainText(Array.from({ length: 40 }, () => "word ".repeat(600).trim()).join("\n\n"));
+    expect(big.ok).toBe(true);
+    if (big.ok) expect(Buffer.byteLength(big.page.text)).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+    expect(extractPlainText("just a line")).toEqual({ ok: false, code: "no_text" });
+  });
+
+  it("does not treat markup-looking text as HTML", () => {
+    const result = extractPlainText(`${"<div>".repeat(2_000)} ${prose.join(" ")}`);
+    expect(result.ok).toBe(true);
   });
 });

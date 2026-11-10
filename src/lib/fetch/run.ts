@@ -3,7 +3,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db, schema } from "@/lib/db";
 import type { LinkContent } from "@/lib/db/schema";
-import { extractHtml, type ExtractedPage } from "@/lib/fetch/extract";
+import { extractHtml, extractPlainText, type ExtractedPage } from "@/lib/fetch/extract";
 import { claimHost, HOST_BUSY_DEFER_MS, releaseHost } from "@/lib/fetch/host";
 import { readFetchedPage, type PageFetcher } from "@/lib/fetch/page";
 import { fixtureByUrl, type FixtureArticle } from "@/lib/links/fixtures";
@@ -95,7 +95,7 @@ async function runFetch(job: JobInfo, ctx: JobContext, deps: FetchDeps): Promise
     const page = await readFetchedPage(row.url, ctx.signal, deps);
     if (ctx.signal.aborted) throw new JobError("timeout");
     assertHttp(page.status);
-    const extracted = extractHtml(page.html);
+    const extracted = page.contentType === "text/plain" ? extractPlainText(page.html) : extractHtml(page.html);
     if (!extracted.ok) throw new JobError(extracted.code, { permanent: true });
     if (ctx.signal.aborted) throw new JobError("timeout");
 

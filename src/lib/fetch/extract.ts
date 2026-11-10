@@ -46,6 +46,26 @@ export function decodePage(body: Buffer, contentType: string | undefined): strin
 }
 
 /**
+ * A `text/plain` response has no markup: Readability would find nothing and the DOM fallback has no text node to read.
+ * Paragraphs are the blocks separated by blank lines, with the same cleaning and 100 KB cap as HTML. Under 200
+ * characters is `no_text`, as for HTML.
+ */
+export function extractPlainText(text: string): ExtractResult {
+  const paragraphs = text
+    .replace(/\r\n?/g, "\n")
+    .split(/\n[^\S\n]*\n/)
+    .map(clean)
+    .filter((paragraph) => paragraph.length > 0);
+  if (capParagraphs(paragraphs).join("\n\n").length < MIN_FALLBACK_CHARS) return { ok: false, code: "no_text" };
+  return finish(paragraphs, { documentTitle: null });
+}
+
+/** The media type of a Content-Type header, lowercased and without parameters. */
+export function mediaTypeOf(contentType: string | undefined): string {
+  return contentType?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+}
+
+/**
  * Readable text only. Readability runs first (it does not execute scripts). When it finds nothing, visible text
  * with the tags stripped is used, and under 200 characters of that is `no_text`. Output is capped at 100 KB.
  */

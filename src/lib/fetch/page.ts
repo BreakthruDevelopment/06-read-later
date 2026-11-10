@@ -1,5 +1,5 @@
 import "server-only";
-import { decodePage } from "@/lib/fetch/extract";
+import { decodePage, mediaTypeOf } from "@/lib/fetch/extract";
 import { safeFetch, type SafeFetchOptions, type SafeFetchResult } from "@/lib/safe-fetch";
 
 export const FETCH_USER_AGENT =
@@ -18,6 +18,8 @@ const MAX_BYTES = 2 * 1024 * 1024;
 export type FetchedPage = {
   status: number;
   html: string;
+  /** Media type of the response, e.g. `text/plain`. */
+  contentType: string;
   finalUrl: string;
   bytes: number;
 };
@@ -47,6 +49,7 @@ export async function readFetchedPage(
   });
   return {
     status: res.status,
+    contentType: mediaTypeOf(res.headers["content-type"]),
     html: decodePage(res.body, res.headers["content-type"]),
     finalUrl: res.url,
     bytes: res.body.length,

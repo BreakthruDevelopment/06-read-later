@@ -256,6 +256,25 @@ describe.skipIf(!url)("fetch pipeline (Postgres)", () => {
     expect(await linkRow(saved.link.id)).toMatchObject({ status: "failed", fail_code: "too_complex" });
   });
 
+  it("stores a text/plain response as paragraphs", async () => {
+    const saved = await save("https://plain.ft.example/notes.txt");
+    const text = [
+      "Plain text has no markup, so paragraphs are the blocks between blank lines in the file.",
+      "This second block exists to push the total well past the two hundred character minimum for stored text.",
+      "A third block keeps the example realistic.",
+    ].join("\r\n\r\n");
+    const handler = run.createFetchHandler({
+      fetch: async (input) => ({ status: 200, url: input, headers: { "content-type": "text/plain; charset=utf-8" }, body: Buffer.from(text) }),
+    });
+    const row = await jobFor(saved.link.id);
+    await worker.createWorker({ handlers: { fetch: handler }, concurrency: 1 }).kick({ ids: [row.id] });
+    const [link] = await sql`select status, content, word_count from link where id = ${saved.link.id}`;
+    expect(link.status).toBe("extracted");
+    expect(link.content.paragraphs).toHaveLength(3);
+    expect(link.content.paragraphs[1]).toContain("two hundred character minimum");
+    expect(link.word_count).toBeGreaterThan(30);
+  });
+
   it("marks the link failed when the worker is killed on the last attempt", async () => {
     const saved = await save("https://killed.ft.example/last");
     const row = await jobFor(saved.link.id);
