@@ -1,15 +1,14 @@
 import { requireUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/http";
-import { summarizeItems } from "@/lib/items";
+import { listTags } from "@/lib/links";
 
 export const dynamic = "force-dynamic";
 
-/** POST /api/ai/summarize — AI summary of the caller's items. */
-export async function POST() {
+/** GET /api/tags — the caller's tags and how many links use each. */
+export async function GET() {
   try {
     const user = await requireUser();
-    const result = await summarizeItems(user);
-    return Response.json(result);
+    return Response.json({ tags: await listTags(user) });
   } catch (err) {
     return errorResponse(err);
   }

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # End-to-end smoke test against a running app (local, CI, or a deployed URL).
-# Signs up two users over HTTP and proves one can't delete the other's item.
-#   BASE_URL=https://app7.breakthruventures.ai ./scripts/smoke.sh
+# Signs up two users, saves one URL twice, and checks the other user cannot read it.
+#   BASE_URL=https://app6.breakthruventures.ai ./scripts/smoke.sh
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:3000}"
 RUN_ID="$(date +%s)$RANDOM"
-JAR_A="$(mktemp)"; JAR_B="$(mktemp)"
-trap 'rm -f "$JAR_A" "$JAR_B"' EXIT
+JAR_A="$(mktemp)"; JAR_B="$(mktemp)"; SAVE_1="$(mktemp)"; SAVE_2="$(mktemp)"
+trap 'rm -f "$JAR_A" "$JAR_B" "$SAVE_1" "$SAVE_2"' EXIT
 
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 pass() { echo "ok - $*"; }
@@ -39,26 +39,48 @@ signup "$JAR_A" "smoke-a-$RUN_ID@example.test"
 signup "$JAR_B" "smoke-b-$RUN_ID@example.test"
 pass "two users signed up"
 
-code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/api/items")
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/api/links")
 [ "$code" = "401" ] || fail "anonymous list should be 401, got $code"
 pass "anonymous access refused"
 
-item=$(curl -fsS -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" \
-  -d '{"title":"smoke item"}' "$BASE_URL/api/items") || fail "create item failed"
-id=$(echo "$item" | sed -E 's/.*"id":"([^"]+)".*/\1/')
-[ -n "$id" ] || fail "no item id in $item"
-pass "user A created an item"
+# Bundled fixture: stored ready, no network fetch. See src/lib/links/fixtures.ts.
+DEMO_URL="https://example.com/read-later/postgres-indexes"
+save() {
+  local jar=$1 out=$2
+  curl -s -o "$out" -w '%{http_code}' -b "$jar" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+    -d "{\"url\":\"$DEMO_URL\"}" "$BASE_URL/api/links"
+}
 
-code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -b "$JAR_B" -H "origin: $BASE_URL" "$BASE_URL/api/items/$id")
-[ "$code" = "403" ] || fail "user B deleting A's item should be 403, got $code"
-pass "user B blocked from A's item"
+code=$(save "$JAR_A" "$SAVE_1")
+[ "$code" = "202" ] || fail "first save should be 202, got $code ($(cat "$SAVE_1"))"
+id=$(sed -E 's/.*"id":"([^"]+)".*/\1/' "$SAVE_1")
+[ -n "$id" ] || fail "no link id in $(cat "$SAVE_1")"
+code=$(save "$JAR_A" "$SAVE_2")
+[ "$code" = "200" ] || fail "second save should be 200, got $code"
+id2=$(sed -E 's/.*"id":"([^"]+)".*/\1/' "$SAVE_2")
+[ "$id" = "$id2" ] || fail "saving twice created two links ($id vs $id2)"
+pass "saving a URL twice returns one link"
 
-code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_A" -H "origin: $BASE_URL" "$BASE_URL/api/ai/summarize")
-[ "$code" = "200" ] || fail "AI summary should be 200, got $code"
-pass "AI summary responds"
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR_B" "$BASE_URL/api/links/$id")
+[ "$code" = "404" ] || fail "user B reading A's link should be 404, got $code"
+pass "user B gets 404 for A's link"
 
-code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -b "$JAR_A" -H "origin: $BASE_URL" "$BASE_URL/api/items/$id")
+patched=$(curl -s -w '\n%{http_code}' -X PATCH -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d '{"tags":["smoke-tag"]}' "$BASE_URL/api/links/$id") || fail "patch tags failed"
+code=$(echo "$patched" | tail -n 1)
+body=$(echo "$patched" | sed '$d')
+[ "$code" = "200" ] || fail "patch tags should be 200, got $code ($body)"
+echo "$body" | grep -q 'smoke-tag' || fail "patched link is missing the tag: $body"
+pass "owner patched tags"
+
+found=$(curl -fsS -b "$JAR_A" --get --data-urlencode "q=database" "$BASE_URL/api/links") || fail "search failed"
+echo "$found" | grep -q "$id" || fail "search did not find the demo article by body text: $found"
+none=$(curl -fsS -b "$JAR_A" --get --data-urlencode "q=zzqxnomatch" "$BASE_URL/api/links") || fail "search failed"
+echo "$none" | grep -q "$id" && fail "search for a missing word returned the article: $none"
+pass "search finds a demo article"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -b "$JAR_A" -H "origin: $BASE_URL" "$BASE_URL/api/links/$id")
 [ "$code" = "204" ] || fail "owner delete should be 204, got $code"
-pass "owner deleted their item"
+pass "owner deleted their link"
 
 echo "SMOKE PASS"
