@@ -20,6 +20,7 @@ describe.skipIf(!url)("links data layer (Postgres)", () => {
   const flood = { id: "lk-flood", role: "user" as const };
   const cap = { id: "lk-cap", role: "user" as const };
   const pager = { id: "lk-pager", role: "user" as const };
+  const retryer = { id: "lk-retry", role: "user" as const };
 
   beforeAll(async () => {
     process.env.DATABASE_URL = url;
@@ -27,7 +28,7 @@ describe.skipIf(!url)("links data layer (Postgres)", () => {
     sql = postgres(url!, { max: 1 });
     await migrate(drizzle(sql), { migrationsFolder: "./drizzle" });
     await sql`delete from "user" where id like 'lk-%'`;
-    for (const u of [alice, bob, admin, hour, day, queuer, flood, cap, pager]) {
+    for (const u of [alice, bob, admin, hour, day, queuer, flood, cap, pager, retryer]) {
       await sql`insert into "user" (id, name, email, role) values (${u.id}, ${u.id}, ${u.id + "@test.local"}, ${u.role})`;
     }
   });
@@ -212,5 +213,33 @@ describe.skipIf(!url)("links data layer (Postgres)", () => {
     expect(counts.linksByStatus.queued).toBeGreaterThan(0);
     expect(counts.queue.queued).toBeGreaterThan(0);
     expect(JSON.stringify(counts)).not.toMatch(/https?:/);
+    const { listUsers } = await import("@/lib/admin-counts");
+    await expect(listUsers(alice)).rejects.toMatchObject({ status: 403 });
+    const users = await listUsers(admin);
+    expect(users.some((user) => user.id === admin.id)).toBe(true);
+    expect(JSON.stringify(users)).not.toMatch(/password|token|https?:/);
+  });
+
+  it("retries a failed link for its owner, and stops after three in a day", async () => {
+    const { saveLink, retryLink } = await import("@/lib/links");
+    const saved = await saveLink(retryer, { url: "https://example.com/retry-me" });
+    await expect(retryLink(retryer, saved.link.id)).rejects.toMatchObject({ status: 409 });
+    await expect(retryLink(bob, saved.link.id)).rejects.toMatchObject({ status: 404 });
+
+    const fail = async () => {
+      await sql`update link set status = 'failed', fail_code = 'timeout' where id = ${saved.link.id}`;
+      await sql`update job set status = 'failed', last_error = 'timeout' where key = ${saved.link.id} and owner_id = ${retryer.id}`;
+    };
+    for (let i = 0; i < 3; i++) {
+      await fail();
+      const again = await retryLink(retryer, saved.link.id);
+      expect(again.status).toBe("queued");
+      expect(again.failCode).toBeNull();
+    }
+    await fail();
+    await expect(retryLink(retryer, saved.link.id)).rejects.toMatchObject({ status: 429 });
+    await expect(retryLink(admin, saved.link.id)).rejects.toMatchObject({ status: 404 });
+    const [row] = await sql<{ status: string }[]>`select status from link where id = ${saved.link.id}`;
+    expect(row.status).toBe("failed");
   });
 });

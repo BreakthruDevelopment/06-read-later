@@ -25,12 +25,15 @@ const config: Record<Status, { label: string; className: string; dot: string }> 
 /** Status and health label. Always shows text, so color is never the only signal. */
 export function StatusBadge({ status, label }: { status: Status; label?: string }) {
   const c = config[status];
+  const text = label ?? c.label;
+  // Long labels (the queued "finishes next visit" chip) wrap instead of widening the page.
+  const wrap = text.length > 22;
   return (
     <span
-      className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-0.5 text-sm font-medium ${c.className}`}
+      className={`inline-flex max-w-full items-center gap-1.5 rounded-md px-2 py-0.5 text-sm font-medium ${wrap ? "whitespace-normal text-left" : "whitespace-nowrap"} ${c.className}`}
     >
-      <span aria-hidden className={`size-2 rounded-full ${c.dot}`} />
-      {label ?? c.label}
+      <span aria-hidden className={`size-2 shrink-0 rounded-full ${c.dot}`} />
+      {text}
     </span>
   );
 }

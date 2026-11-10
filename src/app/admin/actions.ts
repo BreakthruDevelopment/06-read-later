@@ -18,8 +18,7 @@ export async function loadDemoAction(_prev: DemoState, _form: FormData): Promise
     const user = await requireRole("admin");
     const result = await loadDemoWorkspace(user);
     scheduleKick(); // the bundled articles are summarized by the job worker
-    revalidatePath("/admin");
-    revalidatePath("/dashboard");
+    revalidatePath("/", "layout");
     return { ok: true, links: result.links };
   } catch (err) {
     if (err instanceof HttpError) return { error: err.message };

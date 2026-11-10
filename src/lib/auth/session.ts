@@ -3,6 +3,7 @@ import { cache } from "react";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { nudge } from "@/lib/jobs/worker";
+import { safeNext } from "@/lib/reader-format";
 import { auth } from "./index";
 import { type Actor, type Role, ForbiddenError, UnauthorizedError, toRole } from "./rbac";
 
@@ -23,17 +24,20 @@ export const getCurrentUser = cache(async (): Promise<CurrentUser | null> => {
   return { id: u.id, name: u.name, email: u.email, role: toRole(u.role) };
 });
 
-/** For pages: send signed-out visitors to the sign-in page. */
-export async function requireUserOrRedirect(): Promise<CurrentUser> {
+/** For pages: send signed-out visitors to the sign-in page, then back to `nextPath` when it is in this app. */
+export async function requireUserOrRedirect(nextPath?: string): Promise<CurrentUser> {
   const user = await getCurrentUser();
-  if (!user) redirect("/sign-in");
+  if (!user) {
+    const next = nextPath ? safeNext(nextPath) : "";
+    redirect(next && next !== "/inbox" ? `/sign-in?next=${encodeURIComponent(next)}` : "/sign-in");
+  }
   return user;
 }
 
-/** For pages: signed-in users without the role go to the dashboard. */
+/** For pages: signed-in users without the role go to the inbox. */
 export async function requireRoleOrRedirect(role: Role): Promise<CurrentUser> {
   const user = await requireUserOrRedirect();
-  if (role === "admin" && user.role !== "admin") redirect("/dashboard");
+  if (role === "admin" && user.role !== "admin") redirect("/inbox");
   return user;
 }
 

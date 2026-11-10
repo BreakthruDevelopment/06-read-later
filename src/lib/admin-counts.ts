@@ -1,5 +1,5 @@
 import "server-only";
-import { count, eq } from "drizzle-orm";
+import { count, desc, eq } from "drizzle-orm";
 import { type Actor, assertCan } from "@/lib/auth/rbac";
 import { db, schema } from "@/lib/db";
 import type { LinkStatus } from "@/lib/db/schema";
@@ -17,6 +17,22 @@ export type AdminCounts = {
   fetchFailuresByCode: Record<string, number>;
   ai: { summariesToday: number; summaryDailyCap: number; fetchesToday: number; fetchDailyCap: number };
 };
+
+/** Accounts for the admin page. Names and emails only: no sessions, tokens, or link contents. */
+export async function listUsers(actor: Actor): Promise<{ id: string; name: string; email: string; role: string; createdAt: Date }[]> {
+  assertCan(actor, "read");
+  return db()
+    .select({
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      createdAt: user.createdAt,
+    })
+    .from(user)
+    .orderBy(desc(user.createdAt))
+    .limit(100);
+}
 
 /** Numbers only. Never titles, URLs, or tags. */
 export async function adminCounts(actor: Actor): Promise<AdminCounts> {

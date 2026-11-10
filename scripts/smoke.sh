@@ -25,11 +25,11 @@ for path in / /sign-in; do
 done
 pass "pages render inside the shared shell"
 
-for path in /dashboard /admin; do
+for path in /dashboard /admin /inbox /archive /favorites /search /tags /settings /save; do
   code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL$path")
   [ "$code" = "307" ] || fail "signed-out $path should redirect (307), got $code"
 done
-pass "signed-out dashboard and admin redirect"
+pass "signed-out library pages redirect"
 
 signup() {
   local jar=$1 email=$2
@@ -87,6 +87,42 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_A" -H "origin: $B
 [ "$code" = "202" ] || fail "owner regenerate should be 202, got $code"
 pass "regenerate: owner 202, other user 404, anonymous 401"
 
+for path in /inbox /archive /favorites /tags /search /settings; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR_A" "$BASE_URL$path")
+  [ "$code" = "200" ] || fail "signed-in $path should be 200, got $code"
+done
+pass "signed-in library pages render"
+
+inbox=$(curl -fsS -b "$JAR_A" "$BASE_URL/inbox") || fail "inbox did not render"
+echo "$inbox" | grep -q 'name="url"' || fail "inbox is missing the save box"
+echo "$inbox" | grep -q "How Postgres indexes speed up queries" || fail "inbox did not render the saved article"
+pass "inbox renders the saved article"
+
+reader=$(curl -fsS -b "$JAR_A" "$BASE_URL/links/$id") || fail "reader did not render"
+echo "$reader" | grep -q "A Postgres index lets the database" || fail "reader did not render the article text"
+echo "$reader" | grep -F -q 'max-w-[68ch]' || fail "reader is missing the 68ch measure"
+echo "$reader" | grep -F -q 'text-[18px]' || fail "reader is missing the 18px type"
+echo "$reader" | grep -q 'rel="noopener noreferrer nofollow"' || fail "original link is missing rel"
+echo "$reader" | grep -q "Couldn't extract readable text" && fail "a stored article rendered the empty-text message"
+pass "reader renders the article text"
+
+save_page=$(curl -fsS -b "$JAR_A" --get --data-urlencode "url=$DEMO_URL" "$BASE_URL/save") || fail "save page did not render"
+echo "$save_page" | grep -q "Nothing is saved until you press Save" || fail "save page can be read as already saving"
+echo "$save_page" | grep -q "$DEMO_URL" || fail "save page did not show the URL"
+list=$(curl -fsS -b "$JAR_A" "$BASE_URL/api/links") || fail "list failed after opening /save"
+count=$(printf '%s' "$list" | grep -o "$id" | wc -l | tr -d ' ')
+[ "$count" = "1" ] || fail "opening /save changed the library ($count copies of $id)"
+pass "save page shows the URL and does not store it"
+
+settings=$(curl -fsS -b "$JAR_A" "$BASE_URL/settings") || fail "settings did not render"
+echo "$settings" | grep -q "encodeURIComponent" || fail "settings is missing the bookmarklet"
+echo "$settings" | grep -q "javascript:location.href=" || fail "settings is missing the bookmarklet code"
+echo "$settings" | grep -q 'href="javascript:' && fail "bookmarklet anchor has a javascript: href in the HTML (React 19 would replace it); it is set after mount"
+echo "$settings" | grep -q 'data-bookmarklet' || fail "settings is missing the drag-to-bookmarks anchor"
+echo "$settings" | grep -q "Safari" || fail "settings is missing the iOS steps"
+echo "$settings" | grep -q "Chrome" || fail "settings is missing the Android steps"
+pass "settings explains the bookmarklet"
+
 patched=$(curl -s -w '\n%{http_code}' -X PATCH -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" \
   -d '{"tags":["smoke-tag"]}' "$BASE_URL/api/links/$id") || fail "patch tags failed"
 code=$(echo "$patched" | tail -n 1)
@@ -95,11 +131,19 @@ body=$(echo "$patched" | sed '$d')
 echo "$body" | grep -q 'smoke-tag' || fail "patched link is missing the tag: $body"
 pass "owner patched tags"
 
+tagged=$(curl -fsS -b "$JAR_A" "$BASE_URL/tags/smoke-tag") || fail "tag page did not render"
+echo "$tagged" | grep -q "How Postgres indexes speed up queries" || fail "tag page did not render the article"
+pass "tag page renders the article"
+
 found=$(curl -fsS -b "$JAR_A" --get --data-urlencode "q=database" "$BASE_URL/api/links") || fail "search failed"
 echo "$found" | grep -q "$id" || fail "search did not find the demo article by body text: $found"
 none=$(curl -fsS -b "$JAR_A" --get --data-urlencode "q=zzqxnomatch" "$BASE_URL/api/links") || fail "search failed"
 echo "$none" | grep -q "$id" && fail "search for a missing word returned the article: $none"
 pass "search finds a demo article"
+
+search_page=$(curl -fsS -b "$JAR_A" --get --data-urlencode "q=indexes" "$BASE_URL/search") || fail "search page did not render"
+echo "$search_page" | grep -q "How Postgres indexes speed up queries" || fail "search page did not render the article"
+pass "search page renders the article"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -b "$JAR_A" -H "origin: $BASE_URL" "$BASE_URL/api/links/$id")
 [ "$code" = "204" ] || fail "owner delete should be 204, got $code"

@@ -1,9 +1,8 @@
-import { desc } from "drizzle-orm";
 import type { Metadata } from "next";
 import { type Column, DataList, PageIntro, Panel, StatGrid, StatTile } from "@/components/ui";
-import { adminCounts } from "@/lib/admin-counts";
+import { adminCounts, listUsers } from "@/lib/admin-counts";
 import { requireRoleOrRedirect } from "@/lib/auth/session";
-import { db, schema } from "@/lib/db";
+import { LIMITS } from "@/lib/limits";
 import { DemoButton } from "./demo-button";
 
 export const metadata: Metadata = { title: "Admin" };
@@ -12,17 +11,7 @@ export const dynamic = "force-dynamic";
 export default async function AdminPage() {
   const admin = await requireRoleOrRedirect("admin");
   const counts = await adminCounts(admin);
-  const users = await db()
-    .select({
-      id: schema.user.id,
-      name: schema.user.name,
-      email: schema.user.email,
-      role: schema.user.role,
-      createdAt: schema.user.createdAt,
-    })
-    .from(schema.user)
-    .orderBy(desc(schema.user.createdAt))
-    .limit(100);
+  const users = await listUsers(admin);
 
   type Row = (typeof users)[number];
   const columns: Column<Row>[] = [
@@ -48,8 +37,20 @@ export default async function AdminPage() {
         <StatTile value={counts.users} label="Users" tone="accent" />
         <StatTile value={counts.queue.queued} label="Queued jobs" />
         <StatTile value={counts.queue.oldestSeconds} label="Oldest queued (seconds)" />
+        <StatTile value={`${counts.ai.fetchesToday}/${counts.ai.fetchDailyCap}`} label="Fetches today" />
         <StatTile value={`${counts.ai.summariesToday}/${counts.ai.summaryDailyCap}`} label="Summaries today" />
       </StatGrid>
+      <Panel title="Caps">
+        <ul className="space-y-1 text-sm">
+          <li>
+            {LIMITS.savesPerHour} saves an hour, {LIMITS.savesPerDay} a day, {LIMITS.linksPerUser} links per account
+          </li>
+          <li>
+            {LIMITS.queuedPerUser} queued fetches per account, {LIMITS.queuedApp} app-wide
+          </li>
+          <li>{LIMITS.retriesPerLinkPerDay} retries per link a day</li>
+        </ul>
+      </Panel>
       <Panel title="Links by status">
         <ul className="grid grid-cols-2 gap-2 text-sm sm:grid-cols-3">
           {Object.entries(counts.linksByStatus).map(([status, n]) => (
