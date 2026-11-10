@@ -162,7 +162,7 @@ export async function listLinks(actor: Actor, input: unknown = {}): Promise<{ li
   if (tsq) extra.push(sql`${link.search} @@ ${tsq}`);
   if (!q && query.cursor) {
     const cursor = decodeCursor(query.cursor);
-    extra.push(sql`(${link.createdAt}, ${link.id}) < (${cursor.createdAt}, ${cursor.id}::uuid)`);
+    extra.push(sql`(${link.createdAt}, ${link.id}) < (${cursor.createdAt.toISOString()}::timestamptz, ${cursor.id}::uuid)`);
   }
   const rows = await db()
     .select()
@@ -201,6 +201,8 @@ async function assertSaveRate(tx: Tx, userId: string): Promise<void> {
   await consumeRate(tx, userId, "save", LIMITS.savesPerDay, "You can save 300 links per day.", { windowSeconds: 86_400 });
 }
 
+// The app-wide advisory lock serializes every save's queue check. That is acceptable at this scale (a few
+// users, 60 saves/hour each); revisit with a counter row or per-shard locks if save traffic grows.
 async function assertQueueRoom(tx: Tx, userId: string): Promise<void> {
   await advisoryLock(tx, "queue:app");
   const [{ mine }] = await tx

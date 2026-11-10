@@ -19,6 +19,7 @@ describe.skipIf(!url)("links data layer (Postgres)", () => {
   const queuer = { id: "lk-queue", role: "user" as const };
   const flood = { id: "lk-flood", role: "user" as const };
   const cap = { id: "lk-cap", role: "user" as const };
+  const pager = { id: "lk-pager", role: "user" as const };
 
   beforeAll(async () => {
     process.env.DATABASE_URL = url;
@@ -26,7 +27,7 @@ describe.skipIf(!url)("links data layer (Postgres)", () => {
     sql = postgres(url!, { max: 1 });
     await migrate(drizzle(sql), { migrationsFolder: "./drizzle" });
     await sql`delete from "user" where id like 'lk-%'`;
-    for (const u of [alice, bob, admin, hour, day, queuer, flood, cap]) {
+    for (const u of [alice, bob, admin, hour, day, queuer, flood, cap, pager]) {
       await sql`insert into "user" (id, name, email, role) values (${u.id}, ${u.id}, ${u.id + "@test.local"}, ${u.role})`;
     }
   });
@@ -100,6 +101,25 @@ describe.skipIf(!url)("links data layer (Postgres)", () => {
     expect((await listLinks(admin, { q: "indexes" })).links).toHaveLength(0);
   });
 
+  it("pages through links with the cursor", async () => {
+    const { listLinks } = await import("@/lib/links");
+    await sql`
+      insert into link (owner_id, url, url_hash, host, created_at)
+      select ${pager.id}, 'https://example.com/page/' || g, md5(g::text) || md5('pager' || g::text), 'example.com', now() - (g || ' minutes')::interval
+      from generate_series(1, 5) g
+    `;
+    const first = await listLinks(pager, { limit: 2 });
+    expect(first.links).toHaveLength(2);
+    expect(first.nextCursor).not.toBeNull();
+    const second = await listLinks(pager, { limit: 2, cursor: first.nextCursor });
+    expect(second.links).toHaveLength(2);
+    const third = await listLinks(pager, { limit: 2, cursor: second.nextCursor });
+    expect(third.links).toHaveLength(1);
+    expect(third.nextCursor).toBeNull();
+    const ids = [...first.links, ...second.links, ...third.links].map((l) => l.id);
+    expect(new Set(ids).size).toBe(5);
+  });
+
   it("refuses a cross-user tag attach at the foreign key", async () => {
     const { saveLink, patchLink } = await import("@/lib/links");
     const owned = await saveLink(alice, { url: "https://example.com/fk-link" });
@@ -112,7 +132,7 @@ describe.skipIf(!url)("links data layer (Postgres)", () => {
       sql`insert into link_tag (link_id, tag_id, owner_id, source) values (${owned.link.id}, ${bobTag.id}, ${alice.id}, 'user')`,
     ).rejects.toMatchObject({ code: "23503" });
     await expect(
-      sql`insert into link_tag (link_id, tag_id, owner_id, source) values (${owned.link.id}, ${aliceTag.id}, ${bob.id}, 'user')`,
+      sql`insert into link_tag (link_id, tag_id, owner_id, source) values (${other.link.id}, ${aliceTag.id}, ${bob.id}, 'user')`,
     ).rejects.toMatchObject({ code: "23503" });
   });
 
@@ -146,13 +166,13 @@ describe.skipIf(!url)("links data layer (Postgres)", () => {
     const { saveLink } = await import("@/lib/links");
     try {
       await sql`
-        insert into job (kind, owner_id, status)
-        select 'fetch', ${flood.id}, 'queued'
+        insert into job (kind, owner_id, status, payload)
+        select 'fetch', null, 'queued', '{"flood":true}'::jsonb
         from generate_series(1, 1000)
       `;
       await expect(saveLink(flood, { url: "https://example.com/flood" })).rejects.toMatchObject({ status: 503 });
     } finally {
-      await sql`delete from job where owner_id = ${flood.id}`;
+      await sql`delete from job where owner_id is null and payload->>'flood' = 'true'`;
     }
   });
 

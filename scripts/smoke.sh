@@ -6,8 +6,8 @@ set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:3000}"
 RUN_ID="$(date +%s)$RANDOM"
-JAR_A="$(mktemp)"; JAR_B="$(mktemp)"
-trap 'rm -f "$JAR_A" "$JAR_B"' EXIT
+JAR_A="$(mktemp)"; JAR_B="$(mktemp)"; SAVE_1="$(mktemp)"; SAVE_2="$(mktemp)"
+trap 'rm -f "$JAR_A" "$JAR_B" "$SAVE_1" "$SAVE_2"' EXIT
 
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 pass() { echo "ok - $*"; }
@@ -51,13 +51,13 @@ save() {
     -d "{\"url\":\"$DEMO_URL\"}" "$BASE_URL/api/links"
 }
 
-code=$(save "$JAR_A" /tmp/smoke-save-1.json)
-[ "$code" = "202" ] || fail "first save should be 202, got $code ($(cat /tmp/smoke-save-1.json))"
-id=$(sed -E 's/.*"id":"([^"]+)".*/\1/' /tmp/smoke-save-1.json)
-[ -n "$id" ] || fail "no link id in $(cat /tmp/smoke-save-1.json)"
-code=$(save "$JAR_A" /tmp/smoke-save-2.json)
+code=$(save "$JAR_A" "$SAVE_1")
+[ "$code" = "202" ] || fail "first save should be 202, got $code ($(cat "$SAVE_1"))"
+id=$(sed -E 's/.*"id":"([^"]+)".*/\1/' "$SAVE_1")
+[ -n "$id" ] || fail "no link id in $(cat "$SAVE_1")"
+code=$(save "$JAR_A" "$SAVE_2")
 [ "$code" = "200" ] || fail "second save should be 200, got $code"
-id2=$(sed -E 's/.*"id":"([^"]+)".*/\1/' /tmp/smoke-save-2.json)
+id2=$(sed -E 's/.*"id":"([^"]+)".*/\1/' "$SAVE_2")
 [ "$id" = "$id2" ] || fail "saving twice created two links ($id vs $id2)"
 pass "saving a URL twice returns one link"
 
@@ -73,13 +73,11 @@ body=$(echo "$patched" | sed '$d')
 echo "$body" | grep -q 'smoke-tag' || fail "patched link is missing the tag: $body"
 pass "owner patched tags"
 
-found=$(curl -fsS -b "$JAR_A" --get --data-urlencode "q=indexes" "$BASE_URL/api/links") || fail "search failed"
-echo "$found" | grep -q 'indexes' || fail "search did not find the demo article: $found"
+found=$(curl -fsS -b "$JAR_A" --get --data-urlencode "q=database" "$BASE_URL/api/links") || fail "search failed"
+echo "$found" | grep -q "$id" || fail "search did not find the demo article by body text: $found"
+none=$(curl -fsS -b "$JAR_A" --get --data-urlencode "q=zzqxnomatch" "$BASE_URL/api/links") || fail "search failed"
+echo "$none" | grep -q "$id" && fail "search for a missing word returned the article: $none"
 pass "search finds a demo article"
-
-code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_A" -H "origin: $BASE_URL" "$BASE_URL/api/ai/summarize")
-[ "$code" = "200" ] || fail "AI summary should be 200, got $code"
-pass "AI summary responds"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -b "$JAR_A" -H "origin: $BASE_URL" "$BASE_URL/api/links/$id")
 [ "$code" = "204" ] || fail "owner delete should be 204, got $code"

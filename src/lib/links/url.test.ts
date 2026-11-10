@@ -15,6 +15,12 @@ describe("normalizeUrl", () => {
     expect(normalizeUrl("https://example.com/a?b=1&a=2").urlHash).toBe(normalizeUrl("https://example.com/a?a=2&b=1").urlHash);
   });
 
+  it("keeps the original query order and encoding in the stored URL", () => {
+    const n = normalizeUrl("https://example.com/a?q=hello%20world&b=1&utm_source=x&a=2");
+    expect(n.url).toBe("https://example.com/a?q=hello%20world&b=1&a=2");
+    expect(n.urlHash).toBe(normalizeUrl("https://example.com/a?a=2&b=1&q=hello+world").urlHash);
+  });
+
   it("strips a default port and keeps an explicit path", () => {
     expect(normalizeUrl("https://example.com:443/x").url).toBe("https://example.com/x");
     expect(normalizeUrl("http://example.com:80").url).toBe("http://example.com/");

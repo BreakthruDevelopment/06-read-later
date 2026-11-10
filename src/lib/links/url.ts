@@ -44,19 +44,33 @@ export function normalizeUrl(raw: unknown): NormalizedUrl {
   }
   parsed.hostname = host;
 
-  const kept = [...parsed.searchParams.entries()].filter(([key]) => !isTracking(key));
-  kept.sort((a, b) => (a[0] === b[0] ? a[1].localeCompare(b[1]) : a[0].localeCompare(b[0])));
-  parsed.search = "";
-  for (const [key, value] of kept) parsed.searchParams.append(key, value);
-
+  // The stored (and later fetched) URL keeps its original query order and encoding; only tracking params go.
+  // Duplicate detection hashes a separate form with the params sorted and re-serialized.
+  const original = parsed.search ? parsed.search.slice(1).split("&") : [];
+  const keptRaw = original.filter((pair) => pair && !isTracking(safeDecode(pair.split("=")[0])));
+  parsed.search = keptRaw.join("&");
   const url = parsed.href;
   if (url.length > MAX_URL) throw new BadRequestError("URL is too long.");
-  return { url, urlHash: createHash("sha256").update(url).digest("hex"), host };
+
+  const hashed = new URL(url);
+  const kept = [...hashed.searchParams.entries()];
+  kept.sort((a, b) => (a[0] === b[0] ? a[1].localeCompare(b[1]) : a[0].localeCompare(b[0])));
+  hashed.search = "";
+  for (const [key, value] of kept) hashed.searchParams.append(key, value);
+  return { url, urlHash: createHash("sha256").update(hashed.href).digest("hex"), host };
 }
 
 function bareHost(hostname: string): string {
   const bare = hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
   return bare.toLowerCase().replace(/\.+$/, "");
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value.replace(/\+/g, " "));
+  } catch {
+    return value;
+  }
 }
 
 function isTracking(key: string): boolean {
