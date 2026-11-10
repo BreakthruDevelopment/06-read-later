@@ -41,6 +41,9 @@ describe("reader format", () => {
     expect(failLabel("no_text")).toBe("Couldn't extract readable text.");
     expect(failLabel(null)).toBeNull();
     expect(failLabel("mystery")).toBe("The page couldn't be fetched.");
+    for (const code of ["too_complex", "http_4xx", "host_busy", "fetch_cap", "lease_expired"]) {
+      expect(failLabel(code)).not.toBe("The page couldn't be fetched.");
+    }
     expect(statusPresentation("queued", false)).toEqual({ tone: "building", label: "Queued" });
     expect(statusPresentation("queued", true).label).toBe("Finishes next time you open the app");
     expect(statusPresentation("failed", true).label).toBe("Failed");

@@ -9,9 +9,11 @@ import { ForbiddenError, UnauthorizedError } from "@/lib/auth/rbac";
 import { requireSameOrigin } from "@/lib/csrf";
 import { env } from "@/lib/env";
 import { HttpError } from "@/lib/errors";
+import { scheduleFetchKick, scheduleKick } from "@/lib/jobs/schedule";
 import { LIMITS } from "@/lib/limits";
 import { deleteLink, patchLink, retryLink, saveLink } from "@/lib/links";
 import { invalidTag, parseTagList } from "@/lib/reader-format";
+import { regenerateSummary } from "@/lib/summaries/run";
 
 export type LinkActionState = { error?: string; ok?: boolean; id?: string; created?: boolean };
 
@@ -34,6 +36,7 @@ export async function saveLinkAction(_prev: LinkActionState, form: FormData): Pr
     await sameOrigin();
     const user = await requireUser();
     const result = await saveLink(user, { url: form.get("url") });
+    scheduleFetchKick(result.created, result.link.status);
     refreshLibrary();
     return { ok: true, id: result.link.id, created: result.created };
   } catch (err) {
@@ -83,6 +86,7 @@ export async function retryLinkAction(_prev: LinkActionState, form: FormData): P
     const user = await requireUser();
     const id = z.uuid().parse(form.get("id"));
     await retryLink(user, id);
+    scheduleKick();
     refreshLibrary();
     return { ok: true, id };
   } catch (err) {
@@ -101,4 +105,18 @@ export async function deleteLinkAction(_prev: LinkActionState, form: FormData): 
     return failure(err);
   }
   redirect("/inbox");
+}
+
+/** Ask for a fresh summary (at most 3 per link). The owner only; anyone else gets "Link not found". */
+export async function regenerateSummaryAction(id: string): Promise<LinkActionState> {
+  try {
+    await sameOrigin();
+    const user = await requireUser();
+    await regenerateSummary(user, id);
+    scheduleKick();
+    refreshLibrary();
+    return { ok: true, id };
+  } catch (err) {
+    return failure(err);
+  }
 }

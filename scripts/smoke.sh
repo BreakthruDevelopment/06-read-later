@@ -14,6 +14,9 @@ pass() { echo "ok - $*"; }
 
 health=$(curl -fsS "$BASE_URL/api/health") || fail "health endpoint unreachable"
 echo "$health" | grep -q '"status":"ok"' || fail "health not ok: $health"
+echo "$health" | grep -q '"queue"' || fail "health missing queue: $health"
+echo "$health" | grep -q '"queued"' || fail "health queue missing queued: $health"
+echo "$health" | grep -q '"oldestSeconds"' || fail "health queue missing oldestSeconds: $health"
 pass "health check"
 
 for path in / /sign-in; do
@@ -43,7 +46,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/api/links")
 [ "$code" = "401" ] || fail "anonymous list should be 401, got $code"
 pass "anonymous access refused"
 
-# Bundled fixture: stored ready, no network fetch. See src/lib/links/fixtures.ts.
+# Bundled fixture: stored with its text, no network fetch; the summarize job finishes it. See src/lib/links/fixtures.ts.
 DEMO_URL="https://example.com/read-later/postgres-indexes"
 save() {
   local jar=$1 out=$2
@@ -64,6 +67,25 @@ pass "saving a URL twice returns one link"
 code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR_B" "$BASE_URL/api/links/$id")
 [ "$code" = "404" ] || fail "user B reading A's link should be 404, got $code"
 pass "user B gets 404 for A's link"
+
+# The bundled article goes through the summarize job with the recorded demo answer (AI_PROVIDER=demo): no network, no key.
+ready=""
+for _ in $(seq 1 30); do
+  got=$(curl -fsS -b "$JAR_A" "$BASE_URL/api/links/$id") || fail "reading the link failed"
+  if echo "$got" | grep -q '"status":"ready"'; then ready="$got"; break; fi
+  sleep 1
+done
+[ -n "$ready" ] || fail "link never reached ready (summarize job did not run): $got"
+echo "$ready" | grep -q '"summary":{"mode":"demo"' || fail "ready link has no demo summary: $ready"
+pass "summarize job ran offline and the link is ready with a summary"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_B" -H "origin: $BASE_URL" "$BASE_URL/api/links/$id/summary")
+[ "$code" = "404" ] || fail "user B regenerating A's summary should be 404, got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "origin: $BASE_URL" "$BASE_URL/api/links/$id/summary")
+[ "$code" = "401" ] || fail "anonymous regenerate should be 401, got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_A" -H "origin: $BASE_URL" "$BASE_URL/api/links/$id/summary")
+[ "$code" = "202" ] || fail "owner regenerate should be 202, got $code"
+pass "regenerate: owner 202, other user 404, anonymous 401"
 
 for path in /inbox /archive /favorites /tags /search /settings; do
   code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR_A" "$BASE_URL$path")

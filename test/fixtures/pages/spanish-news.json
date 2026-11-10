@@ -1,0 +1,16 @@
+{
+  "id": "spanish-news",
+  "title": "El gobierno aprueba un plan para ampliar la red de trenes de cercanías",
+  "site": "Diario del Sur",
+  "byline": "Marta Gómez",
+  "existingTags": [
+    "politics",
+    "economy"
+  ],
+  "paragraphs": [
+    "El Consejo de Ministros aprobó este martes un plan para ampliar la red de trenes de cercanías en las principales áreas metropolitanas del país. La inversión prevista asciende a 2.400 millones de euros y se repartirá a lo largo de seis años.",
+    "Según el ministro de Transportes, el objetivo es reducir los tiempos de viaje y animar a más personas a dejar el coche en casa. El plan incluye nuevas estaciones, la renovación de las vías más antiguas y la compra de 120 trenes eléctricos.",
+    "Las asociaciones de usuarios celebraron el anuncio, aunque pidieron que las obras no provoquen cortes prolongados del servicio. Los sindicatos, por su parte, reclamaron más personal de mantenimiento para la nueva red.",
+    "La oposición criticó que el calendario sea demasiado largo y que parte de los fondos dependa de ayudas europeas todavía pendientes de aprobación. El primer tramo de las obras comenzará, según el Gobierno, a principios del próximo año."
+  ]
+}

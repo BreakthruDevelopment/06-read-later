@@ -3,6 +3,7 @@ import { type Column, DataList, DemoBadge } from "@/components/ui";
 import type { LinkView } from "@/lib/links";
 import { fixtureByUrl } from "@/lib/links/fixtures";
 import { readingLabel } from "@/lib/reader-format";
+import { AiTagBadge } from "./ai-tag-badge";
 import { RetryButton } from "./link-controls";
 import { StatusChip } from "./status-chip";
 
@@ -47,9 +48,12 @@ export function LinkList({ links, empty }: { links: LinkView[]; empty: string })
         ) : (
           <span className="inline-flex flex-wrap justify-end gap-x-2 gap-y-1 sm:justify-start">
             {link.tags.map((tag) => (
-              <Link key={tag.id} href={`/tags/${tag.name}`} className="text-accent hover:underline">
-                {tag.name}
-              </Link>
+              <span key={tag.id} className="inline-flex items-center gap-1">
+                <Link href={`/tags/${tag.name}`} className="text-accent hover:underline">
+                  {tag.name}
+                </Link>
+                {tag.source === "ai" && <AiTagBadge />}
+              </span>
             ))}
           </span>
         ),

@@ -2,11 +2,13 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { DeleteLinkButton, FlagButton, RetryButton, TagEditor } from "@/components/library/link-controls";
+import { AiTagBadge } from "@/components/library/ai-tag-badge";
 import { StatusChip } from "@/components/library/status-chip";
+import { SummaryCard } from "@/components/library/summary-card";
 import { DemoBadge, PageIntro, Panel } from "@/components/ui";
 import { requireUserOrRedirect } from "@/lib/auth/session";
 import { NotFoundError } from "@/lib/errors";
-import { getLink, getLinkSummary, type LinkView, type SummaryView } from "@/lib/links";
+import { getLink, type LinkView } from "@/lib/links";
 import { fixtureByUrl } from "@/lib/links/fixtures";
 import { failLabel, isUnfinished, readingLabel, type LinkStatus } from "@/lib/reader-format";
 
@@ -23,15 +25,6 @@ export default async function ReaderPage({ params }: { params: Promise<{ id: str
   } catch (err) {
     if (err instanceof NotFoundError) notFound();
     throw err;
-  }
-
-  let summary: SummaryView | null = null;
-  let summaryError: string | null = null;
-  try {
-    summary = await getLinkSummary(user, id);
-  } catch (err) {
-    if (err instanceof NotFoundError) notFound();
-    summaryError = "The summary couldn't be loaded.";
   }
 
   const minutes = readingLabel(item.wordCount);
@@ -83,11 +76,33 @@ export default async function ReaderPage({ params }: { params: Promise<{ id: str
         <Article status={item.status} failCode={item.failCode} paragraphs={item.content?.paragraphs ?? []} />
       </Panel>
       <Panel title="Summary">
-        <SummaryBody status={item.status} failCode={item.failCode} summary={summary} error={summaryError} />
+        <SummaryCard
+          id={item.id}
+          status={item.status}
+          failCode={item.failCode}
+          summary={
+            item.summary && {
+              mode: item.summary.mode,
+              summary: item.summary.summary,
+              keyPoints: item.summary.keyPoints,
+              lowQuality: item.summary.lowQuality,
+              regenerationsLeft: item.summary.regenerationsLeft,
+            }
+          }
+        />
       </Panel>
       <Panel title="Tags">
         {aiTags.length > 0 && (
-          <p className="mb-3 text-sm text-muted">From the summary: {aiTags.map((tag) => tag.name).join(", ")}</p>
+          <ul className="mb-3 flex flex-wrap items-center gap-2 text-sm">
+            {aiTags.map((tag) => (
+              <li key={tag.id} className="inline-flex items-center gap-1">
+                <Link href={`/tags/${tag.name}`} className="font-semibold text-accent hover:underline">
+                  {tag.name}
+                </Link>
+                <AiTagBadge />
+              </li>
+            ))}
+          </ul>
         )}
         <TagEditor id={item.id} tags={userTags.join(" ")} />
       </Panel>
@@ -127,59 +142,6 @@ function Article({
           {paragraph}
         </p>
       ))}
-    </div>
-  );
-}
-
-function SummaryBody({
-  status,
-  failCode,
-  summary,
-  error,
-}: {
-  status: LinkStatus;
-  failCode: string | null;
-  summary: SummaryView | null;
-  error: string | null;
-}) {
-  if (error) {
-    return (
-      <p role="alert" className="text-sm font-medium text-danger">
-        {error}
-      </p>
-    );
-  }
-  if (status === "failed") {
-    return (
-      <p role="alert" className="text-sm font-medium text-danger">
-        {failLabel(failCode) ?? "No summary, because the page didn't load."}
-      </p>
-    );
-  }
-  if (isUnfinished(status)) return <p className="text-sm text-muted">Summary is on the way.</p>;
-  if (!summary) return <p className="text-sm text-muted">No summary for this page.</p>;
-  if (summary.unavailable) {
-    return (
-      <p role="alert" className="text-sm font-medium text-danger">
-        Summary unavailable.
-      </p>
-    );
-  }
-  return (
-    <div className="max-w-[68ch] space-y-3">
-      {summary.lowQuality && (
-        <p role="alert" className="text-sm font-medium text-danger">
-          This page may be a paywall or error page.
-        </p>
-      )}
-      <p>{summary.summary}</p>
-      {summary.keyPoints.length > 0 && (
-        <ul className="list-disc space-y-1 pl-5">
-          {summary.keyPoints.map((point, index) => (
-            <li key={`${index}-${point.slice(0, 24)}`}>{point}</li>
-          ))}
-        </ul>
-      )}
     </div>
   );
 }

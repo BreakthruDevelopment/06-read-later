@@ -1,6 +1,7 @@
 import { requireUser } from "@/lib/auth/session";
 import { requireSameOrigin } from "@/lib/csrf";
 import { errorResponse, readJson } from "@/lib/http";
+import { scheduleFetchKick } from "@/lib/jobs/schedule";
 import { LIMITS } from "@/lib/limits";
 import { listLinks, saveLink } from "@/lib/links";
 
@@ -33,6 +34,7 @@ export async function POST(request: Request) {
     const user = await requireUser();
     const body = await readJson(request, LIMITS.jsonBodyBytes);
     const result = await saveLink(user, body);
+    scheduleFetchKick(result.created, result.link.status);
     return Response.json({ id: result.link.id, status: result.link.status }, { status: result.created ? 202 : 200 });
   } catch (err) {
     return errorResponse(err);

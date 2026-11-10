@@ -56,9 +56,9 @@ export type EnqueueInput = z.input<typeof enqueueSchema>;
 
 const ACTIVE_KEYED = sql`${job.status} in ('queued', 'running') and ${job.key} is not null`;
 const secs = (ms: number) => sql`make_interval(secs => ${ms / 1000})`;
-// run_after is timestamp(3). now() has microseconds, and storing it rounds to the nearest millisecond, which can
-// land in the future: a job due now is then skipped, and a 15s backoff reads back as slightly over 15s.
-const dueAt = (ms: number) => sql`date_trunc('milliseconds', now()) + ${secs(ms)}`;
+// `run_after` is timestamp(3). `now()` rounds, so it can be stored up to half a millisecond in the future and a kick
+// in the same instant will not see the job. Truncate so a job that is due now is claimable now.
+const dueAt = (ms: number) => sql`date_trunc('milliseconds', clock_timestamp()) + ${secs(ms)}`;
 
 /**
  * Add a job unless one with the same (kind, key) is already queued or running; then return that one.
@@ -162,14 +162,22 @@ export async function claim(tx: Handle, opts: { kinds: readonly string[]; limit:
  * process, or keeps timing out past the lease). Mark it failed so the UI shows Retry and its key is free.
  */
 export async function failExhausted(tx: Handle, kinds: readonly string[]): Promise<number> {
-  if (kinds.length === 0) return 0;
-  const rows = await tx.execute(sql`
+  return (await failExhaustedJobs(tx, kinds)).length;
+}
+
+/** Same as `failExhausted`, but returns the jobs it failed so the caller can tidy whatever they were working on. */
+export async function failExhaustedJobs(
+  tx: Handle,
+  kinds: readonly string[],
+): Promise<Pick<ClaimedJob, "id" | "kind" | "key" | "ownerId" | "payload">[]> {
+  if (kinds.length === 0) return [];
+  const rows = await tx.execute<{ id: string; kind: string; key: string | null; owner_id: string | null; payload: Record<string, unknown> }>(sql`
     update job set status = 'failed', last_error = 'lease_expired', locked_until = null, lock_token = null,
       finished_at = now(), updated_at = now()
     where kind in (${inList(kinds)}) and status = 'running' and locked_until < now() and attempts >= max_attempts
-    returning id
+    returning id, kind, key, owner_id, payload
   `);
-  return rows.length;
+  return rows.map((r) => ({ id: r.id, kind: r.kind, key: r.key, ownerId: r.owner_id, payload: r.payload }));
 }
 
 const holds = (j: Pick<ClaimedJob, "id" | "lockToken">) =>
@@ -261,7 +269,7 @@ export async function retryJob(
   if (target.status !== "failed") return "not_found";
   try {
     const rows = await tx.execute(sql`
-      update job set status = 'queued', attempts = 0, deferrals = 0, run_after = date_trunc('milliseconds', now()), last_error = null, finished_at = null, updated_at = now()
+      update job set status = 'queued', attempts = 0, deferrals = 0, run_after = date_trunc('milliseconds', clock_timestamp()), last_error = null, finished_at = null, updated_at = now()
       where id = ${target.id} and status = 'failed'
       returning id
     `);

@@ -4,6 +4,15 @@
  * Each app adds a fixture for each AI task it defines.
  */
 export const demoFixtures: Record<string, unknown> = {
+  // Saved-page summary (app 6). Recorded, so it never claims to be from a live model.
+  "summarize-link": {
+    summary:
+      "Demo summary (recorded, not from a live model): the article explains how small teams ship reliable software by automating tests and deploys.",
+    keyPoints: ["Automated checks catch routine mistakes", "Small, frequent deploys limit risk"],
+    tags: ["engineering", "devops"],
+    kind: "article",
+    lowQuality: false,
+  },
   "summarize-items": {
     summary:
       "You have a few open items. The most recent ones focus on setup work; nothing looks overdue.",

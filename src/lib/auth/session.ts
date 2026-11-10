@@ -19,6 +19,8 @@ export const getCurrentUser = cache(async (): Promise<CurrentUser | null> => {
   if (!result?.user) return null;
   const u = result.user as typeof result.user & { role?: string | null; banned?: boolean | null };
   if (u.banned) return null;
+  // Debounced (once per 10s per process) so due jobs run while anyone is signed in.
+  nudge();
   return { id: u.id, name: u.name, email: u.email, role: toRole(u.role) };
 });
 

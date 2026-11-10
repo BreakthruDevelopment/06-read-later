@@ -6,6 +6,8 @@ import { db, schema } from "@/lib/db";
 import type { LinkContent, LinkStatus, TagSource } from "@/lib/db/schema";
 import { BadRequestError, ConflictError, HttpError, NotFoundError, TooManyRequestsError } from "@/lib/errors";
 import { enqueue, retryJob } from "@/lib/jobs/queue";
+import { MAX_REGENERATIONS } from "@/lib/summaries/limits";
+import { storedSummarySchema, type StoredSummary } from "@/lib/summaries/guardrails";
 import { LIMITS } from "@/lib/limits";
 import { log } from "@/lib/log";
 import { ownedBy } from "@/lib/owned";
@@ -13,7 +15,7 @@ import { type Tx, advisoryLock, consumeRate } from "@/lib/usage";
 import { FIXTURES, fixtureByUrl, type FixtureArticle } from "@/lib/links/fixtures";
 import { normalizeUrl } from "@/lib/links/url";
 
-const { link, linkTag, linkSummary, tag, job, rateEvent } = schema;
+const { link, linkTag, tag, job, rateEvent, linkSummary } = schema;
 
 const TAG_NAME = /^[a-z0-9][a-z0-9-]{1,23}$/;
 
@@ -60,6 +62,21 @@ export type LinkView = {
   createdAt: Date;
   updatedAt: Date;
   tags: TagView[];
+  /** Plain text only: render it as text, never as HTML or Markdown. Null until a summary exists. */
+  summary: SummaryView | null;
+};
+
+export type SummaryView = {
+  /** `live` or `demo` (recorded answer) have text; `skipped` (too little text) and `pending` (regeneration queued, none yet) don't. */
+  mode: "live" | "demo" | "skipped" | "pending";
+  summary: string | null;
+  keyPoints: string[];
+  kind: StoredSummary["kind"] | null;
+  /** Show "This page may be a paywall or error page". */
+  lowQuality: boolean;
+  generatedAt: Date;
+  /** Regenerations left for this link (of 3). */
+  regenerationsLeft: number;
 };
 
 export type SaveResult = { link: LinkView; created: boolean };
@@ -77,7 +94,7 @@ function contentView(content: LinkContent | null): LinkView["content"] {
   return { byline: content.byline, site: content.site, paragraphs: content.paragraphs ?? [] };
 }
 
-function toView(row: LinkRow, tags: TagView[]): LinkView {
+function toView(row: LinkRow, tags: TagView[], summary: SummaryView | null): LinkView {
   return {
     id: row.id,
     url: row.url,
@@ -96,7 +113,32 @@ function toView(row: LinkRow, tags: TagView[]): LinkView {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     tags,
+    summary,
   };
+}
+
+async function summariesFor(ownerId: string, linkIds: string[]): Promise<Map<string, SummaryView>> {
+  const map = new Map<string, SummaryView>();
+  if (linkIds.length === 0) return map;
+  const rows = await db()
+    .select()
+    .from(linkSummary)
+    .where(and(eq(linkSummary.ownerId, ownerId), inArray(linkSummary.linkId, linkIds)));
+  for (const row of rows) {
+    const parsed = storedSummarySchema.safeParse(row.data);
+    const mode = row.mode === "live" || row.mode === "demo" || row.mode === "skipped" ? row.mode : "pending";
+    const usable = parsed.success && (mode === "live" || mode === "demo");
+    map.set(row.linkId, {
+      mode,
+      summary: usable ? parsed.data.summary : null,
+      keyPoints: usable ? parsed.data.keyPoints : [],
+      kind: usable ? parsed.data.kind : null,
+      lowQuality: usable ? parsed.data.lowQuality : false,
+      generatedAt: row.generatedAt,
+      regenerationsLeft: Math.max(0, MAX_REGENERATIONS - row.regenerations),
+    });
+  }
+  return map;
 }
 
 async function tagsFor(ownerId: string, linkIds: string[]): Promise<Map<string, TagView[]>> {
@@ -117,8 +159,8 @@ async function tagsFor(ownerId: string, linkIds: string[]): Promise<Map<string, 
 }
 
 async function oneView(row: LinkRow): Promise<LinkView> {
-  const tags = await tagsFor(row.ownerId, [row.id]);
-  return toView(row, tags.get(row.id) ?? []);
+  const [tags, summaries] = await Promise.all([tagsFor(row.ownerId, [row.id]), summariesFor(row.ownerId, [row.id])]);
+  return toView(row, tags.get(row.id) ?? [], summaries.get(row.id) ?? null);
 }
 
 function encodeCursor(row: { createdAt: Date; id: string }): string {
@@ -172,9 +214,10 @@ export async function listLinks(actor: Actor, input: unknown = {}): Promise<{ li
     .limit(query.limit + 1);
   const hasMore = rows.length > query.limit;
   const page = hasMore ? rows.slice(0, query.limit) : rows;
-  const tags = await tagsFor(actor.id, page.map((row) => row.id));
+  const ids = page.map((row) => row.id);
+  const [tags, summaries] = await Promise.all([tagsFor(actor.id, ids), summariesFor(actor.id, ids)]);
   return {
-    links: page.map((row) => toView(row, tags.get(row.id) ?? [])),
+    links: page.map((row) => toView(row, tags.get(row.id) ?? [], summaries.get(row.id) ?? null)),
     nextCursor: !q && hasMore ? encodeCursor(page[page.length - 1]) : null,
   };
 }
@@ -234,7 +277,8 @@ function fixtureValues(ownerId: string, article: FixtureArticle) {
     excerpt: article.excerpt,
     content: { byline: article.byline, site: article.siteName, paragraphs: article.paragraphs, text: article.text } satisfies LinkContent,
     wordCount: article.wordCount,
-    status: "ready" as const,
+    // Text is already stored, so these skip the fetch and go straight to the summarize job (offline in demo mode).
+    status: "extracted" as const,
     failCode: null,
   };
 }
@@ -257,8 +301,10 @@ export async function upsertFixtures(tx: Tx, ownerId: string): Promise<number> {
       await tx
         .delete(job)
         .where(and(eq(job.ownerId, ownerId), eq(job.kind, "fetch"), eq(job.key, current), sql`${job.status} in ('queued', 'running')`));
+      await enqueue(tx, { kind: "summarize", key: current, ownerId, payload: { linkId: current } });
     } else {
-      await tx.insert(link).values(values);
+      const [row] = await tx.insert(link).values(values).returning({ id: link.id });
+      await enqueue(tx, { kind: "summarize", key: row.id, ownerId, payload: { linkId: row.id } });
     }
   }
   return FIXTURES.length;
@@ -266,7 +312,7 @@ export async function upsertFixtures(tx: Tx, ownerId: string): Promise<number> {
 
 /**
  * Save a URL for the actor. The same normalized URL returns the existing link.
- * A bundled fixture is stored ready, with no fetch. Anything else is queued and a fetch job is enqueued.
+ * A bundled fixture is stored with its text and gets a summarize job, with no fetch. Anything else is queued and a fetch job is enqueued.
  */
 export async function saveLink(actor: Actor, input: unknown): Promise<SaveResult> {
   assertCan(actor, "create");
@@ -283,11 +329,12 @@ export async function saveLink(actor: Actor, input: unknown): Promise<SaveResult
     if (existing) return { row: existing, created: false };
     await assertLinkCap(tx, actor.id, 1);
     await assertSaveRate(tx, actor.id);
+    await assertQueueRoom(tx, actor.id);
     if (fixture) {
       const [row] = await tx.insert(link).values(fixtureValues(actor.id, fixture)).returning();
+      await enqueue(tx, { kind: "summarize", key: row.id, ownerId: actor.id, payload: { linkId: row.id } });
       return { row, created: true };
     }
-    await assertQueueRoom(tx, actor.id);
     const [row] = await tx
       .insert(link)
       .values({ ownerId: actor.id, url: normalized.url, urlHash: normalized.urlHash, host: normalized.host, status: "queued" })
@@ -358,42 +405,6 @@ export async function deleteLink(actor: Actor, id: unknown): Promise<void> {
     return true;
   });
   if (!removed) throw new NotFoundError("Link not found");
-}
-
-export type SummaryView = {
-  summary: string;
-  keyPoints: string[];
-  lowQuality: boolean;
-  /** The stored JSON didn't match the summary shape. */
-  unavailable: boolean;
-};
-
-const summaryData = z.object({
-  summary: z.string().min(1).max(600),
-  keyPoints: z.array(z.string().max(200)).max(5).optional(),
-  lowQuality: z.boolean().optional(),
-});
-
-/** The owner's summary for a link, or null when none has been stored. 404 for anyone else. */
-export async function getLinkSummary(actor: Actor, id: unknown): Promise<SummaryView | null> {
-  assertCan(actor, "read", { ownerId: actor.id });
-  const linkId = parseId(id);
-  const [owned] = await db().select({ id: link.id }).from(link).where(ownedBy(link, actor, eq(link.id, linkId))).limit(1);
-  if (!owned) throw new NotFoundError("Link not found");
-  const [summary] = await db()
-    .select({ data: linkSummary.data })
-    .from(linkSummary)
-    .where(and(eq(linkSummary.linkId, linkId), eq(linkSummary.ownerId, actor.id)))
-    .limit(1);
-  if (!summary) return null;
-  const parsed = summaryData.safeParse(summary.data);
-  if (!parsed.success) return { summary: "Summary unavailable", keyPoints: [], lowQuality: false, unavailable: true };
-  return {
-    summary: parsed.data.summary,
-    keyPoints: (parsed.data.keyPoints ?? []).filter((point) => point.length > 0),
-    lowQuality: parsed.data.lowQuality ?? false,
-    unavailable: false,
-  };
 }
 
 function payloadRecord(value: unknown): Record<string, unknown> {

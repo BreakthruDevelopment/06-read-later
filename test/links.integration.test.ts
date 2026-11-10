@@ -88,14 +88,14 @@ describe.skipIf(!url)("links data layer (Postgres)", () => {
     expect(rest.links[0].id).not.toBe(page.links[0].id);
   });
 
-  it("stores a fixture article ready, with no fetch job, and search finds it only for the owner", async () => {
+  it("stores a fixture article with its text and a summarize job (no fetch job), and search finds it only for the owner", async () => {
     const { saveLink, listLinks } = await import("@/lib/links");
     const saved = await saveLink(alice, { url: "https://example.com/read-later/postgres-indexes" });
-    expect(saved.link.status).toBe("ready");
+    expect(saved.link.status).toBe("extracted");
     expect(saved.link.title).toMatch(/indexes/i);
     expect(saved.link.content?.paragraphs.length).toBeGreaterThan(0);
-    const [{ n }] = await sql`select count(*)::int as n from job where key = ${saved.link.id}`;
-    expect(n).toBe(0);
+    const jobs = await sql`select kind from job where key = ${saved.link.id}`;
+    expect(jobs.map((j) => j.kind)).toEqual(["summarize"]);
     const own = await listLinks(alice, { q: "indexes" });
     expect(own.links.some((link) => link.id === saved.link.id)).toBe(true);
     expect((await listLinks(bob, { q: "indexes" })).links).toHaveLength(0);
@@ -241,29 +241,5 @@ describe.skipIf(!url)("links data layer (Postgres)", () => {
     await expect(retryLink(admin, saved.link.id)).rejects.toMatchObject({ status: 404 });
     const [row] = await sql<{ status: string }[]>`select status from link where id = ${saved.link.id}`;
     expect(row.status).toBe("failed");
-  });
-
-  it("reads a summary only for the owner", async () => {
-    const { saveLink, getLinkSummary } = await import("@/lib/links");
-    const saved = await saveLink(alice, { url: "https://example.com/summary-row" });
-    expect(await getLinkSummary(alice, saved.link.id)).toBeNull();
-    await expect(getLinkSummary(bob, saved.link.id)).rejects.toMatchObject({ status: 404 });
-    await sql`
-      insert into link_summary (link_id, owner_id, data, mode, input_hash)
-      values (
-        ${saved.link.id},
-        ${alice.id},
-        ${JSON.stringify({ summary: "Indexes let Postgres skip a full table read.", keyPoints: ["B-trees serve ranges"], lowQuality: false })}::jsonb,
-        'demo',
-        'hash'
-      )
-    `;
-    const summary = await getLinkSummary(alice, saved.link.id);
-    expect(summary?.unavailable).toBe(false);
-    expect(summary?.summary).toMatch(/indexes/i);
-    expect(summary?.keyPoints).toEqual(["B-trees serve ranges"]);
-    await sql`update link_summary set data = '{"nope":true}'::jsonb where link_id = ${saved.link.id}`;
-    expect((await getLinkSummary(alice, saved.link.id))?.unavailable).toBe(true);
-    await expect(getLinkSummary(admin, saved.link.id)).rejects.toMatchObject({ status: 404 });
   });
 });

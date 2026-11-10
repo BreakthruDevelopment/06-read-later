@@ -11,15 +11,23 @@ const TAG_NAME = /^[a-z0-9][a-z0-9-]{1,23}$/;
 
 export type ChipTone = "live" | "building" | "failed" | "not-started";
 
+export const SUMMARY_FAILED = "summary_failed";
+
 const FAIL_LABELS: Record<string, string> = {
   blocked_address: "That address can't be fetched.",
   timeout: "The site took too long to respond.",
   too_large: "The page is too large to save.",
+  too_complex: "The page is too complex to read.",
+  too_many_redirects: "The page redirected too many times.",
   bad_content_type: "That page isn't HTML or plain text.",
   http_4xx: "The site refused the page.",
   http_5xx: "The site had an error.",
   dns: "The site's address didn't resolve.",
+  network: "The site couldn't be reached.",
   no_text: "Couldn't extract readable text.",
+  host_busy: "That site is busy right now. Try again in a few minutes.",
+  fetch_cap: "Today's page-fetch limit was reached. Try again tomorrow.",
+  lease_expired: "The fetch was interrupted before it finished. Retry it.",
 };
 
 export function isLinkStatus(value: unknown): value is LinkStatus {
