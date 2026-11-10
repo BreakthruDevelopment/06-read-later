@@ -76,8 +76,9 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 [ -n "$ready" ] || fail "link never reached ready (summarize job did not run): $got"
-echo "$ready" | grep -q '"summary":{"mode":"demo"' || fail "ready link has no demo summary: $ready"
-pass "summarize job ran offline and the link is ready with a summary"
+# Locally and in CI the answer is the recorded demo one; against a live deploy it comes from the model.
+echo "$ready" | grep -Eq '"summary":\{"mode":"(demo|live)"' || fail "ready link has no summary: $ready"
+pass "summarize job ran and the link is ready with a summary"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_B" -H "origin: $BASE_URL" "$BASE_URL/api/links/$id/summary")
 [ "$code" = "404" ] || fail "user B regenerating A's summary should be 404, got $code"
