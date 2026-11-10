@@ -1,14 +1,17 @@
 import { desc } from "drizzle-orm";
 import type { Metadata } from "next";
 import { type Column, DataList, PageIntro, Panel, StatGrid, StatTile } from "@/components/ui";
+import { adminCounts } from "@/lib/admin-counts";
 import { requireRoleOrRedirect } from "@/lib/auth/session";
 import { db, schema } from "@/lib/db";
+import { DemoButton } from "./demo-button";
 
 export const metadata: Metadata = { title: "Admin" };
 export const dynamic = "force-dynamic";
 
 export default async function AdminPage() {
-  await requireRoleOrRedirect("admin");
+  const admin = await requireRoleOrRedirect("admin");
+  const counts = await adminCounts(admin);
   const users = await db()
     .select({
       id: schema.user.id,
@@ -40,11 +43,38 @@ export default async function AdminPage() {
 
   return (
     <>
-      <PageIntro section="Admin" title="Users" description="Everyone who has signed up, newest first." />
+      <PageIntro section="Admin" title="Counts" description="Totals only. Other people's links, titles, and tags stay private." />
       <StatGrid>
-        <StatTile value={users.length} label="Users" tone="accent" />
-        <StatTile value={users.filter((u) => u.role === "admin").length} label="Admins" />
+        <StatTile value={counts.users} label="Users" tone="accent" />
+        <StatTile value={counts.queue.queued} label="Queued jobs" />
+        <StatTile value={counts.queue.oldestSeconds} label="Oldest queued (seconds)" />
+        <StatTile value={`${counts.ai.summariesToday}/${counts.ai.summaryDailyCap}`} label="Summaries today" />
       </StatGrid>
+      <Panel title="Links by status">
+        <ul className="grid grid-cols-2 gap-2 text-sm sm:grid-cols-3">
+          {Object.entries(counts.linksByStatus).map(([status, n]) => (
+            <li key={status}>
+              <span className="font-semibold">{n}</span> <span className="text-muted">{status}</span>
+            </li>
+          ))}
+        </ul>
+      </Panel>
+      <Panel title="Fetch failures by code">
+        {Object.keys(counts.fetchFailuresByCode).length === 0 ? (
+          <p className="text-sm text-muted">None.</p>
+        ) : (
+          <ul className="text-sm">
+            {Object.entries(counts.fetchFailuresByCode).map(([code, n]) => (
+              <li key={code}>
+                <span className="font-semibold">{n}</span> <span className="text-muted">{code}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Panel>
+      <Panel title="Demo workspace">
+        <DemoButton />
+      </Panel>
       <Panel title="All users" count={users.length}>
         <DataList caption="Users" rows={users} rowKey={(u) => u.id} columns={columns} empty="No users yet." />
       </Panel>
