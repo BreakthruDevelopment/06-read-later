@@ -434,11 +434,11 @@ describe.skipIf(!url)("fetch pipeline (Postgres)", () => {
     }
   });
 
-  it("stores a bundled fixture without fetching", async () => {
+  it("stores a bundled fixture without fetching (it goes to the summarize job)", async () => {
     const { DEMO_SEARCH_URL } = await import("@/lib/links/fixtures");
     const saved = await save(DEMO_SEARCH_URL);
-    expect(saved.link.status).toBe("ready");
-    const [{ n }] = await sql`select count(*)::int as n from job where key = ${saved.link.id}`;
+    expect(saved.link.status).toBe("extracted");
+    const [{ n }] = await sql`select count(*)::int as n from job where key = ${saved.link.id} and kind = 'fetch'`;
     expect(n).toBe(0);
   });
 });

@@ -70,6 +70,7 @@ async function runFetch(job: JobInfo, ctx: JobContext, deps: FetchDeps): Promise
   const fixture = fixtureByUrl.get(row.url);
   if (fixture) {
     await storeFixture(row, fixture);
+    await enqueueSummarize(ownerId, linkId);
     return;
   }
 
@@ -235,7 +236,7 @@ async function storeFixture(row: LinkRef, article: FixtureArticle): Promise<void
       excerpt: article.excerpt,
       content,
       wordCount: article.wordCount,
-      status: "ready",
+      status: "extracted",
       failCode: null,
       updatedAt: sql`now()`,
     })
