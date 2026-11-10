@@ -14,6 +14,9 @@ pass() { echo "ok - $*"; }
 
 health=$(curl -fsS "$BASE_URL/api/health") || fail "health endpoint unreachable"
 echo "$health" | grep -q '"status":"ok"' || fail "health not ok: $health"
+echo "$health" | grep -q '"queue"' || fail "health missing queue: $health"
+echo "$health" | grep -q '"queued"' || fail "health queue missing queued: $health"
+echo "$health" | grep -q '"oldestSeconds"' || fail "health queue missing oldestSeconds: $health"
 pass "health check"
 
 for path in / /sign-in; do
