@@ -8,6 +8,7 @@ import { ForbiddenError, UnauthorizedError } from "@/lib/auth/rbac";
 import { requireSameOrigin } from "@/lib/csrf";
 import { env } from "@/lib/env";
 import { HttpError } from "@/lib/errors";
+import { scheduleFetchKick } from "@/lib/jobs/schedule";
 import { deleteLink, patchLink, saveLink } from "@/lib/links";
 
 export type LinkActionState = { error?: string; ok?: boolean; id?: string };
@@ -27,6 +28,7 @@ export async function saveLinkAction(_prev: LinkActionState, form: FormData): Pr
     await sameOrigin();
     const user = await requireUser();
     const result = await saveLink(user, { url: form.get("url") });
+    scheduleFetchKick(result.created, result.link.status);
     revalidatePath("/dashboard");
     return { ok: true, id: result.link.id };
   } catch (err) {

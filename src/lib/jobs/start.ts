@@ -7,9 +7,9 @@ import "server-only";
 export async function startJobs(): Promise<boolean> {
   const { whenMigrated } = await import("../db/migrate-on-start");
   await whenMigrated();
-  const { handlers } = await import("./handlers");
+  const { handlers, onGiveUp } = await import("./handlers");
   if (Object.keys(handlers).length === 0) return false;
   const { startWorker } = await import("./worker");
-  startWorker({ handlers });
+  startWorker({ handlers, onGiveUp });
   return true;
 }
