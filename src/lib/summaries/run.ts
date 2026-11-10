@@ -153,8 +153,19 @@ async function runSummarize(job: JobInfo, ctx: JobContext, deps: SummaryDeps): P
   }
   // The call took the whole time box: the worker already counted this attempt as timed out, so don't write behind its back.
   if (ctx.signal.aborted) throw new JobError("timeout");
-  // A live-configured app that fell back to the recorded answer did not use a live call.
-  if (live && result.demo) await releaseDaily(db(), "summarize").catch(() => undefined);
+  // A live-configured app whose provider failed gets the recorded answer from generate() (AI_FALLBACK_TO_DEMO). That
+  // answer is about no real page: never store it or create its tags. Refund both counters and fail so backoff, then
+  // `summary_failed`, apply.
+  if (live && result.demo) {
+    await refund().catch((e) => log.error("summarize.refund_failed", safeErrorFields(e)));
+    log.warn("summarize.failed", { task: "summarize-link", host: row.host, kind: "demo_fallback" });
+    throw new JobError("ai_failed");
+  }
+  // Every sentence of the summary was risky (a page that took over the model, or an unusable answer): store nothing.
+  if (result.rejected) {
+    log.warn("summarize.rejected", { task: "summarize-link", host: row.host, codes: result.codes });
+    throw new JobError("summary_rejected", { permanent: true });
+  }
 
   const stale = await db().transaction(async (tx) => {
     const [fresh] = await tx
@@ -255,14 +266,14 @@ export async function regenerateSummary(actor: Actor, id: unknown): Promise<Rege
     if (!row) throw new NotFoundError("Link not found");
     if (row.status === "extracted" || row.status === "summarizing") throw new ConflictError("A summary is already being made.");
     if (row.status !== "ready" || !row.hasText) throw new ConflictError("This link has no readable text to summarize.");
-    const [existing] = await tx.select({ regenerations: linkSummary.regenerations }).from(linkSummary).where(eq(linkSummary.linkId, linkId)).limit(1);
+    const [existing] = await tx.select({ regenerations: linkSummary.regenerations }).from(linkSummary).where(and(eq(linkSummary.linkId, linkId), eq(linkSummary.ownerId, actor.id))).limit(1);
     const used = existing?.regenerations ?? 0;
     if (used >= MAX_REGENERATIONS) throw new TooManyRequestsError("A summary can be regenerated 3 times.");
     const [{ since }] = await tx.execute<{ since: number }>(sql`select (extract(epoch from clock_timestamp()) * 1000)::float8 as since`);
     const queued = await enqueue(tx, { kind: "summarize", key: linkId, ownerId: actor.id, payload: { linkId, regenerate: true, since: Number(since) } });
     if (!queued.created) throw new ConflictError("A summary is already being made.");
     if (existing) {
-      await tx.update(linkSummary).set({ regenerations: used + 1 }).where(eq(linkSummary.linkId, linkId));
+      await tx.update(linkSummary).set({ regenerations: used + 1 }).where(and(eq(linkSummary.linkId, linkId), eq(linkSummary.ownerId, actor.id)));
     } else {
       // No summary yet (it failed, or never ran): a placeholder row keeps the count.
       await tx.insert(linkSummary).values({ linkId, ownerId: actor.id, data: {}, mode: "pending", inputHash: "", regenerations: 1 });

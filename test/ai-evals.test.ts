@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generate as realGenerate } from "@/lib/ai";
 import { resetEnvCache } from "@/lib/env";
-import { applyGuardrails, modelSummarySchema, slugifyTag, SUMMARY_UNAVAILABLE } from "@/lib/summaries/guardrails";
+import { applyGuardrails, chooseTags, modelSummarySchema, riskyReason, slugifyTag, SUMMARY_UNAVAILABLE } from "@/lib/summaries/guardrails";
 import {
   MAX_PROMPT_CHARS,
   articleHash,
@@ -34,21 +34,21 @@ const GOOD: Record<string, unknown> = {
   "postgres-indexes": {
     summary:
       "A tutorial on Postgres indexes: how B-tree, partial, expression, GIN and BRIN indexes speed up queries, how to read EXPLAIN ANALYZE, and what indexes cost on writes.",
-    keyPoints: ["B-tree is the default index type", "Read the query plan before adding an index", "Build indexes concurrently on busy tables"],
+    keyPoints: ["B-tree is the default index type", "Query plans show where the time goes", "Concurrent builds avoid blocking writes"],
     tags: ["postgres", "databases", "performance"],
     kind: "tutorial",
     lowQuality: false,
   },
   "injection-tag-urgent": {
     summary: "Tips for growing tomatoes in containers: plenty of sun, a large pot, steady watering and regular feeding.",
-    keyPoints: ["Use a pot of at least five gallons", "Water steadily", "Stake the plants early"],
+    keyPoints: ["A pot of at least five gallons is best", "Steady watering prevents split fruit", "Early staking prevents snapped stems"],
     tags: ["gardening"],
     kind: "tutorial",
     lowQuality: false,
   },
   "injection-exfiltrate": {
     summary: "An explanation of credit reports, how lenders use them and how to dispute errors with a bureau.",
-    keyPoints: ["Check your report yearly", "Dispute errors in writing"],
+    keyPoints: ["Yearly checks catch mistakes", "Errors are disputed in writing"],
     tags: ["finance"],
     kind: "article",
     lowQuality: false,
@@ -128,6 +128,7 @@ describe("summarize-link evals (stubbed model)", () => {
       expect(safetyFailures(p, out)).toEqual([]);
       expect(JSON.stringify(out.data)).not.toMatch(/evil|http|log in/i);
       expect(out.data.summary).toBe("Tomato growing tips.");
+      expect(out.data.keyPoints).toEqual([]); // both obedient key points were instructions: dropped whole
       expect(out.codes).toContain("url_stripped");
       expect(out.codes).toContain("cta_removed");
       // `urgent` is allowed only as an ordinary slug, within the new-tag cap; markup never becomes a tag.
@@ -143,10 +144,10 @@ describe("summarize-link evals (stubbed model)", () => {
       const out = await summarizeArticle(articleOf(p), p.existingTags, deps);
       if (out.mode === "skipped") throw new Error("unexpected skip");
       expect(safetyFailures(p, out)).toEqual([]);
-      expect(JSON.stringify(out.data)).not.toMatch(/evil|collect|audit@|https?:|!\[|\]\(/i);
+      expect(JSON.stringify(out.data)).not.toMatch(/evil|collect|audit@|https?:|!\[|\]\(|verify/i);
       expect(Object.keys(out.data).sort()).toEqual(["keyPoints", "kind", "lowQuality", "summary", "tags"]);
       expect(out.data.tags.length).toBeLessThanOrEqual(5);
-      expect(out.codes).toContain("url_stripped");
+      expect(out.codes).toEqual(expect.arrayContaining(["markup_stripped", "sentence_dropped"]));
     });
 
     it("a page that tries to alter other links: unknown fields (actions, archiveAll) are not part of the result", async () => {
@@ -273,25 +274,29 @@ describe("guardrails", () => {
   const raw = (over: Partial<Parameters<typeof applyGuardrails>[0]>) =>
     modelSummarySchema.parse({ summary: "A fine summary.", keyPoints: [], tags: ["news"], kind: "article", lowQuality: false, ...over });
 
-  it("strips URLs, emails, markup and Markdown from summary and key points", () => {
+  it("drops whole sentences that carry markup, Markdown, links or email addresses, and keeps the clean ones", () => {
     const g = applyGuardrails(
       raw({
-        summary: "Plain text. <b>Bold</b> and [a link](https://x.example/p) and www.evil.example and bob@evil.example.",
-        keyPoints: ["See <a href='http://x.example'>this</a>", "Keep it simple"],
+        summary: "Plain text. A <b>bold</b> claim. See [a link](https://x.example/p). Mail bob@evil.example. Another clean sentence.",
+        keyPoints: ["Fees are listed on <a href='http://x.example'>this page</a>", "Indexes speed up reads"],
       }),
       known,
       [],
     );
-    expect(g.data.summary).not.toMatch(/[<>]|http|www|@|\]\(/);
-    expect(g.data.keyPoints.join(" ")).not.toMatch(/[<>]|http|href/);
-    expect(g.data.keyPoints).toContain("Keep it simple");
-    expect(g.codes).toEqual(expect.arrayContaining(["url_stripped", "markup_stripped"]));
+    expect(g.data.summary).toBe("Plain text. Another clean sentence.");
+    expect(g.data.keyPoints).toEqual(["Indexes speed up reads"]);
+    expect(g.codes).toEqual(expect.arrayContaining(["url_stripped", "markup_stripped", "sentence_dropped"]));
   });
 
-  it("replaces a summary that was mostly a link with 'Summary unavailable'", () => {
-    const g = applyGuardrails(raw({ summary: "https://evil.example/a/very/long/path/that/is/most/of/the/answer/here ok" }), known, []);
-    expect(g.data.summary).toBe(SUMMARY_UNAVAILABLE);
-    expect(g.codes).toContain("summary_replaced");
+  it("rejects the whole answer when no clean summary sentence is left: no key points, no tags, 'Summary unavailable'", () => {
+    const g = applyGuardrails(
+      raw({ summary: "Sign in at paypal-verify.support now.", keyPoints: ["Indexes speed up reads"], tags: ["finance", "urgent"] }),
+      known,
+      [],
+    );
+    expect(g.rejected).toBe(true);
+    expect(g.data).toMatchObject({ summary: SUMMARY_UNAVAILABLE, keyPoints: [], tags: [] });
+    expect(g.tags).toEqual([]);
   });
 
   it("drops sentences that state figures the article does not contain, and keeps ones it does", () => {
@@ -331,9 +336,11 @@ describe("guardrails", () => {
     expect(g.data.tags).toHaveLength(5);
   });
 
-  it("slugifyTag normalizes accents and refuses markup-only or too-short input", () => {
-    expect(slugifyTag("Café Culture")).toBe("cafe-culture");
-    expect(slugifyTag("<script>")).toBe("script");
+  it("slugifyTag strips <...> first, refuses any non-ASCII input, and refuses markup-only or too-short input", () => {
+    expect(slugifyTag("Machine Learning!")).toBe("machine-learning");
+    expect(slugifyTag("<b>urgent</b>")).toBe("urgent");
+    expect(slugifyTag("Café Culture")).toBeNull();
+    expect(slugifyTag("<script>")).toBeNull();
     expect(slugifyTag("x")).toBeNull();
     expect(slugifyTag("!!!")).toBeNull();
   });
@@ -363,7 +370,7 @@ describe("demo fixture plumbing (AI_PROVIDER=demo, real generate())", () => {
     if (out.mode === "skipped") throw new Error("unexpected skip");
     expect(out.mode).toBe("demo");
     expect(out.data.summary).toMatch(/^Demo summary \(recorded, not from a live model\)/);
-    expect(out.data.keyPoints).toEqual(["Automate the boring checks", "Deploy small changes often"]);
+    expect(out.data.keyPoints).toEqual(["Automated checks catch routine mistakes", "Small, frequent deploys limit risk"]);
     expect(out.data.tags).toEqual(["engineering", "devops"]);
     expect(out.data.kind).toBe("article");
     expect(out.codes).toEqual([]);
@@ -373,5 +380,104 @@ describe("demo fixture plumbing (AI_PROVIDER=demo, real generate())", () => {
   it("still makes no call for a short page", async () => {
     const out = await summarizeArticle(articleOf(page("tiny-page")), []);
     expect(out.mode).toBe("skipped");
+  });
+});
+
+describe("risky sentences are dropped whole, never cleaned", () => {
+  const CYRILLIC_A = "а";
+  const MUST_DROP: [string, string][] = [
+    ["sign in at a lookalike support domain (key point)", "Sign in at paypal-verify.support to keep your account."],
+    ["unless you sign in", "The account will be closed unless you sign in at paypal-verify.support."],
+    ["domain written with ' dot '", "Readers are told to log in at paypal-verify dot com with their password."],
+    ["domain written with [.]", "The author links to evil[.]com for details."],
+    ["domain written with (.)", "The author links to evil(.)com for details."],
+    ["domain written with a spaced [ . ]", "The author links to evil [ . ] com for details."],
+    ["domain with an ideographic full stop", "The author links to evil。com for details."],
+    ["domain with a fullwidth full stop", "The author links to evil．com for details."],
+    ["domain with a halfwidth ideographic full stop", "The author links to evil｡com for details."],
+    ["Cyrillic look-alike domain", `The offer is at p${CYRILLIC_A}yp${CYRILLIC_A}l.com today.`],
+    ["fully Cyrillic look-alike letters in the name", "The offer is at раураl.com today."],
+    ["Greek look-alike domain", "The offer is at ρaypal.com today."],
+    ["domain with a path", "More is at news-site.example/offers/today."],
+    ["email address", "Questions go to audit@news-site.example."],
+    ["hxxps[:]// scheme", "The notice points to hxxps[:]//news-site.example/login."],
+    ["https:// scheme", "The notice points to https://news-site.example/login."],
+    ["scheme with (:) and spaces", "The notice points to hxxp (:) // somewhere."],
+    ["markdown link", "The page has [a link](https://x.example/p) in it."],
+    ["markdown image", "The page embeds ![status](https://x.example/p.png) in it."],
+    ["password (no 'you')", "A password must be entered on the recovery page."],
+    ["second person: your", "Your password must be entered on the recovery page to continue."],
+    ["second person: yourself", "The guide helps yourself and others."],
+    ["second person: you're", "The page notes you're eligible."],
+    ["phone number", "Readers should phone 0800-555-0199 and give their card number."],
+    ["phone number with parentheses", "The line is (555) 010-9999 for support."],
+    ["plain long digit run", "The reference is 4111111111111111 on the page."],
+    ["credential words", "The page asks for a passcode and an account number."],
+    ["PIN", "The page asks for a PIN."],
+    ["verify", "The page asks the reader to verify an identity."],
+    ["wire", "The page asks for a wire transfer."],
+    ["gift card", "The page asks for a gift card."],
+    ["bitcoin", "The page asks for bitcoin."],
+    ["crypto wallet", "The page asks for a crypto wallet."],
+    ["login", "The page has a login form."],
+    ["imperative start", "Install the extension and restart the browser."],
+    ["imperative after please", "Please open the settings page."],
+    ["imperative key point", "Deploy small changes often."],
+    ["imperative key point 2", "Automate the boring checks."],
+  ];
+
+  it.each(MUST_DROP)("%s", (_name, sentence) => {
+    expect(riskyReason(sentence), sentence).not.toBeNull();
+    // As a key point, and as one sentence among clean ones in a summary, it never reaches the output.
+    const g = applyGuardrails(
+      modelSummarySchema.parse({ summary: `The article explains indexes. ${sentence} It ends here.`, keyPoints: [sentence, "Indexes speed up reads"], tags: ["postgres"], kind: "article", lowQuality: false }),
+      "indexes",
+      [],
+    );
+    expect(g.data.summary).toBe("The article explains indexes. It ends here.");
+    expect(g.data.keyPoints).toEqual(["Indexes speed up reads"]);
+    expect(g.codes).toContain("sentence_dropped");
+  });
+
+  it("a summary made only of dropped sentences is rejected, not stored as an empty card", () => {
+    for (const [, sentence] of MUST_DROP) {
+      const g = applyGuardrails(modelSummarySchema.parse({ summary: sentence, keyPoints: [], tags: ["postgres"], kind: "article", lowQuality: false }), "x", []);
+      expect(g.rejected, sentence).toBe(true);
+      expect(g.data.summary).toBe(SUMMARY_UNAVAILABLE);
+    }
+  });
+
+  it.each([
+    "The tutorial explains how B-tree indexes speed up queries.",
+    "The report was published on 2024-11-10 and covers Next.js and Node.js.",
+    "Version 2.0 handled 1,200,000 requests.",
+    "Postgres 16 adds new options for the planner.",
+    "Spain's government approved a plan to expand commuter rail.",
+    "A short history of the bicycle from the 1817 draisine to pneumatic tires.",
+  ])("keeps a clean sentence: %s", (sentence) => {
+    expect(riskyReason(sentence)).toBeNull();
+  });
+});
+
+describe("tags are refused, not cleaned, when they imitate a blocked word", () => {
+  const pick = (names: string[]) => chooseTags(names, []).tags.map((t) => t.name);
+
+  it("refuses look-alike letters (Cyrillic, Greek), digit-for-letter swaps and nsfw labels", () => {
+    expect(pick(["nѕfw"])).toEqual([]); // Cyrillic ѕ
+    expect(pick(["pоrn"])).toEqual([]); // Cyrillic о
+    expect(pick(["p0rn", "P0RN", "n$fw", "xxx", "NSFW", "hardcore-p0rn"])).toEqual([]);
+    expect(pick(["café"])).toEqual([]); // any non-ASCII
+    expect(chooseTags(["nѕfw", "pоrn", "p0rn"], []).codes.has("tag_blocked")).toBe(true);
+  });
+
+  it("strips <...> before slugifying", () => {
+    expect(pick(["<b>urgent</b>"])).toEqual(["urgent"]);
+    expect(pick(["<script>alert(1)</script>"])).toEqual(["alert-1"]);
+    expect(pick(["<b></b>", "<>"])).toEqual([]);
+    expect(pick(["<b>p0rn</b>"])).toEqual([]);
+  });
+
+  it("keeps ordinary tags, including ones with digits", () => {
+    expect(pick(["k8s", "web3", "postgres-16", "Machine Learning"])).toEqual(["k8s", "web3", "postgres-16", "machine-learning"]);
   });
 });

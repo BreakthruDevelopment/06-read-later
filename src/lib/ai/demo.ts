@@ -8,7 +8,7 @@ export const demoFixtures: Record<string, unknown> = {
   "summarize-link": {
     summary:
       "Demo summary (recorded, not from a live model): the article explains how small teams ship reliable software by automating tests and deploys.",
-    keyPoints: ["Automate the boring checks", "Deploy small changes often"],
+    keyPoints: ["Automated checks catch routine mistakes", "Small, frequent deploys limit risk"],
     tags: ["engineering", "devops"],
     kind: "article",
     lowQuality: false,

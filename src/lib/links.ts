@@ -329,12 +329,12 @@ export async function saveLink(actor: Actor, input: unknown): Promise<SaveResult
     if (existing) return { row: existing, created: false };
     await assertLinkCap(tx, actor.id, 1);
     await assertSaveRate(tx, actor.id);
+    await assertQueueRoom(tx, actor.id);
     if (fixture) {
       const [row] = await tx.insert(link).values(fixtureValues(actor.id, fixture)).returning();
       await enqueue(tx, { kind: "summarize", key: row.id, ownerId: actor.id, payload: { linkId: row.id } });
       return { row, created: true };
     }
-    await assertQueueRoom(tx, actor.id);
     const [row] = await tx
       .insert(link)
       .values({ ownerId: actor.id, url: normalized.url, urlHash: normalized.urlHash, host: normalized.host, status: "queued" })

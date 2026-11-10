@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { TLDS } from "./tlds";
 
 /**
  * Code-side guardrails for `summarize-link`. The model's answer is untrusted: the page it read may have tried to steer it.
@@ -44,8 +45,10 @@ export type StoredSummary = z.infer<typeof storedSummarySchema>;
 
 export type GuardrailCode =
   | "url_stripped"
+  | "phone_removed"
   | "markup_stripped"
   | "summary_replaced"
+  | "sentence_dropped"
   | "cta_removed"
   | "ungrounded_number"
   | "summary_truncated"
@@ -54,74 +57,97 @@ export type GuardrailCode =
   | "tag_limit"
   | "new_tag_limit";
 
-/** Small on purpose: nsfw-style labels and a few slurs. Extend it here; tags matching any dash-separated part are dropped. */
-const TAG_BLOCKLIST = new Set([
-  "nsfw", "porn", "porno", "xxx", "nude", "nudes", "hentai", "erotic", "gore", "explicit", "fetish",
-  "retard", "retarded", "faggot", "tranny",
-]);
+/**
+ * Small on purpose: nsfw-style labels and a few slurs. Extend it here. A tag is refused when any entry appears in it
+ * (dashes removed, digit-for-letter swaps undone), so `p0rn` and `hardcore-porn` go the same way as `porn`.
+ */
+const TAG_BLOCKLIST = [
+  "nsfw", "porn", "xxx", "nude", "hentai", "erotic", "gore", "explicit", "fetish",
+  "retard", "faggot", "tranny",
+];
 
-const INVISIBLE = /[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠-⁩﻿]/g;
-const MARKDOWN_IMAGE = /!\[[^\]]*\]\([^)]*\)/g;
-const MARKDOWN_LINK = /\[([^\]]*)\]\([^)]*\)/g;
-const SCHEME_URL = /\b[a-z][a-z0-9+.-]{1,20}:\/\/\S+/gi;
-const PSEUDO_URL = /\b(?:javascript|data|mailto|tel|file):\S*/gi;
-const WWW_URL = /\bwww\.\S+/gi;
-const EMAIL = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g;
-const BARE_DOMAIN =
-  /\b(?:[a-z0-9-]+\.)+(?:com|org|net|io|ai|dev|app|co|me|ly|info|biz|xyz|example|test|edu|gov|ru|cn|tk|ml|ga|cf|gq|top|site|online|link|click|zip)\b(?:[/:?#]\S*)?/gi;
+const INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
 
-const CTA_VERB =
-  "log ?in|sign ?in|sign ?up|click|tap|visit|go to|navigate to|download|install|open|enter|verify|confirm|follow|subscribe|call|email|send|submit|reply|register|contact|buy|purchase|pay|share|forward|copy|paste|reset|update your";
-const CTA_ANYWHERE = new RegExp(`\\b(?:${CTA_VERB})\\b`, "i");
-const CTA_IMPERATIVE_START = new RegExp(`^(?:(?:please|kindly|now|also|then|and)[,\\s]+)*(?:${CTA_VERB})\\b`, "i");
-const CTA_ADDRESSED = new RegExp(
-  `\\b(?:please|kindly|(?:you|reader|readers|user|users)\\s+(?:must|should|need to|needs to|have to|can|may|will need to|are asked to|are advised to|are required to))\\b[^.!?]*\\b(?:${CTA_VERB})\\b`,
-  "i",
+/**
+ * Cyrillic and Greek letters that look like Latin ones, lowercase (input is lowercased first). Enough to turn a
+ * look-alike domain such as "раураl.com" back into the ASCII name it imitates.
+ */
+const LOOKALIKES: Record<string, string> = {
+  а: "a", в: "b", с: "c", ԁ: "d", е: "e", ё: "e", к: "k", ӏ: "l", м: "m", н: "h", о: "o", р: "p", ԛ: "q", ѕ: "s",
+  т: "t", у: "y", х: "x", і: "i", ї: "i", ј: "j", һ: "h", ԝ: "w", ь: "b", ґ: "r", ᴀ: "a", ɡ: "g",
+  α: "a", β: "b", γ: "y", ε: "e", ι: "i", κ: "k", ν: "v", ο: "o", ρ: "p", τ: "t", υ: "u", χ: "x", ω: "w", η: "n", μ: "u",
+};
+const LOOKALIKE_RE = new RegExp(`[${Object.keys(LOOKALIKES).join("")}]`, "g");
+
+/** Dots written so a filter will not see them: "[.]", "(.)", "{.}", "。", "｡", " dot ", "[dot]", "(dot)". */
+const OBFUSCATED_DOT = /\s*(?:\[\s*\.\s*\]|\(\s*\.\s*\)|\{\s*\.\s*\}|\[\s*dot\s*\]|\(\s*dot\s*\)|[。｡．]|\s+dot\s+)\s*/g;
+const DOMAIN_TOKEN = /[a-z0-9\u00a1-\uffff_-]+(?:\.[a-z0-9\u00a1-\uffff_-]+)+/g;
+/** "http://", "hxxps[:]//", "ftp ://": a scheme, however it is spelled. */
+const SCHEME_FRAGMENT = /\b[a-z]{3,10}\s*[[(]?:[\])]?\s*\/\//;
+const ISO_DATE = /\b\d{4}-\d{2}-\d{2}\b/g;
+/** Seven or more digits, with single separators allowed between them: a phone, account or card number. */
+const PHONE_SHAPED = /\d(?:[\s().+-]?\d){6,}/;
+const SECOND_PERSON = /\byou(?:r|rs|rself|rselves)?\b|\byou['’](?:re|ll|ve|d)\b/;
+const CREDENTIAL =
+  /\b(?:password|passcode|pin|log[\s-]?in|log[\s-]?on|signin|sign[\s-]?in|verify|verif(?:ies|ied|ying|ication)|account number|card number|ssn|social security|wire|gift card|bitcoin|crypto(?:currency)?(?: wallet)?|seed phrase)\b/;
+
+/** Base-form verbs that begin an instruction ("Sign in…", "Deploy small changes…"). */
+const IMPERATIVE_VERBS = new Set(
+  `sign log click tap press visit go navigate download install open enter verify confirm follow subscribe call phone email text
+  send submit reply register contact buy purchase pay share forward copy paste reset update upgrade check see read learn find use
+  try get make take keep add remove delete run build deploy automate water feed pinch stake plant grow avoid ensure remember consider start stop create set write
+  choose pick select apply review watch listen look note notice ignore skip consult ask tell give let put turn move change fix
+  test measure monitor track compare split join save store rename drop limit prefer maintain define design plan prepare configure
+  enable disable allow protect secure back migrate import export clear clean wait expect assume treat think begin finish launch
+  publish upload scan wipe lock unlock activate claim redeem win earn invest trust act hurry order book attend reach stay do don't
+  never always be beware warn report access provide include mention paste unsubscribe approve accept agree grant complete fill`
+    .split(/\s+/)
+    .filter(Boolean),
 );
+const LEAD_IN = /^(?:["'“”‘’(\-*•\d.)\s]*)(?:(?:please|kindly|now|also|then|and|just|first|next|finally)[,\s]+)*/;
 
-/** Count of characters removed by a replace, summed over every match. */
-function strip(text: string, pattern: RegExp, replacement = " "): { text: string; removed: number } {
-  let removed = 0;
-  const out = text.replace(pattern, (m) => {
-    removed += m.length;
-    return replacement;
-  });
-  return { text: out, removed };
+export type DropReason = "url" | "phone" | "markup" | "second_person" | "credential" | "imperative";
+
+function variants(sentence: string): string[] {
+  const base = sentence.normalize("NFKC").toLowerCase().replace(INVISIBLE, " ");
+  const mapped = base.replace(LOOKALIKE_RE, (c) => LOOKALIKES[c] ?? c);
+  return mapped === base ? [base] : [base, mapped];
 }
 
-type Cleaned = { text: string; urlRemoved: number; markup: boolean };
-
-/** Remove markup, Markdown links, URLs and email addresses from one piece of text. */
-function cleanText(input: string): Cleaned {
-  let text = input.normalize("NFKC").replace(INVISIBLE, " ");
-  const tagStrip = strip(text, /<[^>]*>/g);
-  let markup = tagStrip.removed > 0;
-  text = tagStrip.text;
-  if (/[<>]/.test(text)) markup = true;
-  text = text.replace(/[<>]/g, " ");
-  let urlRemoved = 0;
-  const image = strip(text, MARKDOWN_IMAGE); // an image is a request to the attacker's server: drop it, label and all
-  text = image.text;
-  urlRemoved += image.removed;
-  text = text.replace(MARKDOWN_LINK, (m, label: string) => {
-    urlRemoved += m.length - label.length;
-    return label;
-  });
-  for (const pattern of [SCHEME_URL, PSEUDO_URL, WWW_URL, EMAIL, BARE_DOMAIN]) {
-    const r = strip(text, pattern);
-    text = r.text;
-    urlRemoved += r.removed;
+function looksLikeDomain(text: string): boolean {
+  const flat = text.replace(OBFUSCATED_DOT, ".");
+  for (const token of flat.match(DOMAIN_TOKEN) ?? []) {
+    const last = token.slice(token.lastIndexOf(".") + 1);
+    if (TLDS.has(last)) return true;
   }
-  text = text
-    .replace(/\(\s*\)|\[\s*\]/g, " ")
-    .replace(/\s+/g, " ")
-    .replace(/\s+([,.;:!?])/g, "$1")
-    .trim();
-  return { text, urlRemoved, markup };
+  return false;
+}
+
+/**
+ * Why a sentence must not be shown, or null when it is clean. A summary cannot be templated, so we do not try to
+ * clean a risky sentence: it is dropped whole. Risky means it contains a domain-like token (obfuscated or imitated
+ * with look-alike letters), a URL scheme, an email address, markup, a phone- or card-shaped number, second person
+ * ("you", "your"), a credential or payment word, or it starts as an instruction.
+ */
+export function riskyReason(sentence: string): DropReason | null {
+  for (const v of variants(sentence)) {
+    if (/[<>]/.test(v) || /\]\(|!\[/.test(v)) return "markup";
+    if (v.includes("@") || SCHEME_FRAGMENT.test(v) || looksLikeDomain(v)) return "url";
+    if (PHONE_SHAPED.test(v.replace(ISO_DATE, " "))) return "phone";
+    if (SECOND_PERSON.test(v)) return "second_person";
+    if (CREDENTIAL.test(v)) return "credential";
+    const first = v.replace(LEAD_IN, "").match(/^[a-z']+/)?.[0];
+    if (first && IMPERATIVE_VERBS.has(first)) return "imperative";
+  }
+  return null;
 }
 
 function splitSentences(text: string): string[] {
-  return text.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
+  // Split after a sentence end that is followed by the start of a new sentence, so "evil [ . ] com" stays in one piece.
+  return text
+    .split(/(?<=[.!?。！？])\s+(?=[A-Z0-9"'“‘(\u00c0-\u024f]|$)|\n+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 /** "1.200", "1,200" and "1200" are the same number; this is how we compare a figure with the article's. */
@@ -137,47 +163,43 @@ function ungroundedNumber(sentence: string, known: Set<string>): boolean {
   return false;
 }
 
-/** A sentence that carried a link and points the reader at it ("see", "details at") is a lure even without an action verb. */
-const POINTS_AT_LINK = /\b(?:see|check|find|read|view|access|head|learn|more (?:info|information|details)|details|status|verify)\b/i;
-
-function isCallToAction(sentence: string, hadUrl: boolean, strict: boolean): boolean {
-  if (hadUrl && (CTA_ANYWHERE.test(sentence) || POINTS_AT_LINK.test(sentence))) return true;
-  if (CTA_ADDRESSED.test(sentence)) return true;
-  // Key points are often imperative ("Deploy small changes often"), so only the summary gets the start-of-sentence rule.
-  return strict && CTA_IMPERATIVE_START.test(sentence);
-}
+const REASON_CODE: Record<DropReason, GuardrailCode> = {
+  url: "url_stripped",
+  phone: "phone_removed",
+  markup: "markup_stripped",
+  second_person: "cta_removed",
+  credential: "cta_removed",
+  imperative: "cta_removed",
+};
 
 type Field = { text: string | null; codes: Set<GuardrailCode> };
 
-/**
- * Clean one summary or key point: strip markup and links, drop sentences that tell the reader to act or state
- * figures the article never contains. Returns null when nothing usable is left (over half stripped, or empty).
- */
-function guardField(raw: string, known: Set<string>, strict: boolean): Field {
+/** Keep the clean sentences of one summary or key point; null when none is left. */
+function guardField(raw: string, known: Set<string>): Field {
   const codes = new Set<GuardrailCode>();
-  const original = raw.normalize("NFKC").replace(INVISIBLE, " ").replace(/\s+/g, " ").trim();
-  const whole = cleanText(raw);
-  if (whole.markup) codes.add("markup_stripped");
-  if (whole.urlRemoved > 0) codes.add("url_stripped");
-  if (original.length > 0 && whole.urlRemoved / original.length > 0.5) {
-    codes.add("summary_replaced");
-    return { text: null, codes };
-  }
   const kept: string[] = [];
-  for (const sentence of splitSentences(raw.normalize("NFKC").replace(INVISIBLE, " ").replace(/<[^>]*>/g, " "))) {
-    const cleaned = cleanText(sentence);
-    if (!cleaned.text) continue;
-    if (isCallToAction(cleaned.text, cleaned.urlRemoved > 0, strict)) {
-      codes.add("cta_removed");
+  for (const sentence of splitSentences(raw.normalize("NFKC").replace(INVISIBLE, " "))) {
+    const reason = riskyReason(sentence);
+    if (reason) {
+      codes.add(REASON_CODE[reason]);
+      codes.add("sentence_dropped");
       continue;
     }
-    if (ungroundedNumber(cleaned.text, known)) {
+    if (ungroundedNumber(sentence, known)) {
       codes.add("ungrounded_number");
+      codes.add("sentence_dropped");
       continue;
     }
-    kept.push(cleaned.text);
+    kept.push(sentence.replace(/\s+/g, " "));
   }
   const text = kept.join(" ").trim();
+  // Defense in depth: what is left, read as a whole, must still be clean (a link or number cannot hide across a split).
+  const whole = text.length > 0 ? riskyReason(text) : null;
+  if (whole) {
+    codes.add(REASON_CODE[whole]);
+    codes.add("sentence_dropped");
+    return { text: null, codes };
+  }
   return { text: text.length > 0 ? text : null, codes };
 }
 
@@ -192,17 +214,30 @@ export function truncateText(text: string, max: number): { text: string; truncat
   return { text: `${(space > max * 0.5 ? room.slice(0, space) : room).replace(/[\s,;:.-]+$/, "")}…`, truncated: true };
 }
 
-/** A short topical slug, or null when nothing usable remains. Never contains markup. */
+const LEET: Record<string, string> = { "0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b", $: "s", "@": "a" };
+
+/**
+ * A short topical slug, or null. `<…>` is removed first, and anything with a non-ASCII character is refused outright
+ * (look-alike letters such as Cyrillic "о" in "pоrn" are how a filter gets evaded), never transliterated.
+ */
 export function slugifyTag(input: string): string | null {
-  const slug = input
-    .normalize("NFKD")
-    .replace(/[̀-ͯ]/g, "")
+  const text = input.replace(/<[^>]*>/g, " ");
+  if (/[^\u0000-\u007f]/.test(text)) return null;
+  const slug = text
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 24)
     .replace(/-+$/g, "");
   return TAG_NAME.test(slug) ? slug : null;
+}
+
+function isBlockedTag(raw: string, slug: string): boolean {
+  return [slug, raw.replace(/<[^>]*>/g, " ").toLowerCase()].some((form) => {
+    const letters = form.replace(/[^a-z0-9$@]/g, "");
+    const unswapped = letters.replace(/[0-9$@]/g, (c) => LEET[c] ?? c);
+    return TAG_BLOCKLIST.some((term) => letters.includes(term) || unswapped.includes(term));
+  });
 }
 
 export type TagChoice = { name: string; isNew: boolean };
@@ -216,10 +251,11 @@ export function chooseTags(candidates: string[], existingTags: readonly string[]
   for (const candidate of candidates) {
     const slug = slugifyTag(candidate);
     if (!slug) {
-      codes.add("tag_invalid");
+      // Non-ASCII look-alikes ("nѕfw") are refused rather than cleaned, so they count as blocked, not just malformed.
+      codes.add(/[^\u0000-\u007f]/.test(candidate) ? "tag_blocked" : "tag_invalid");
       continue;
     }
-    if (slug.split("-").some((part) => TAG_BLOCKLIST.has(part)) || TAG_BLOCKLIST.has(slug.replace(/-/g, ""))) {
+    if (isBlockedTag(candidate, slug)) {
       codes.add("tag_blocked");
       continue;
     }
@@ -248,28 +284,37 @@ export function chooseTags(candidates: string[], existingTags: readonly string[]
   return { tags, codes };
 }
 
-export type GuardedSummary = { data: StoredSummary; tags: TagChoice[]; codes: GuardrailCode[] };
+export type GuardedSummary = {
+  data: StoredSummary;
+  tags: TagChoice[];
+  codes: GuardrailCode[];
+  /** No clean sentence was left in the summary: show nothing from the model (`data` holds "Summary unavailable"). */
+  rejected: boolean;
+};
 
 /**
  * Turn the model's answer into what we store and show. `articleText` is the text the model was given (figures in the
- * summary must appear in it); `existingTags` are the names offered to the model.
+ * summary must appear in it); `existingTags` are the names offered to the model. When every sentence of the summary
+ * had to be dropped the whole answer is rejected: no key points, no tags, and the caller stores nothing.
  */
 export function applyGuardrails(raw: ModelSummary, articleText: string, existingTags: readonly string[]): GuardedSummary {
   const known = digitRuns(articleText);
   const codes = new Set<GuardrailCode>();
 
-  const summaryField = guardField(raw.summary, known, true);
+  const summaryField = guardField(raw.summary, known);
   summaryField.codes.forEach((c) => codes.add(c));
-  let summary = summaryField.text ?? SUMMARY_UNAVAILABLE;
-  if (summaryField.text === null) codes.add("summary_replaced");
-  const cut = truncateText(summary, MAX_SUMMARY_CHARS);
+  if (summaryField.text === null) {
+    codes.add("summary_replaced");
+    const data = storedSummarySchema.parse({ summary: SUMMARY_UNAVAILABLE, keyPoints: [], tags: [], kind: raw.kind, lowQuality: raw.lowQuality });
+    return { data, tags: [], codes: [...codes].sort(), rejected: true };
+  }
+  const cut = truncateText(summaryField.text, MAX_SUMMARY_CHARS);
   if (cut.truncated) codes.add("summary_truncated");
-  summary = cut.text;
 
   const keyPoints: string[] = [];
   for (const point of raw.keyPoints) {
     if (keyPoints.length >= MAX_KEY_POINTS) break;
-    const field = guardField(point, known, false);
+    const field = guardField(point, known);
     field.codes.forEach((c) => codes.add(c));
     if (!field.text) continue;
     const short = truncateText(field.text, MAX_KEY_POINT_CHARS);
@@ -281,11 +326,11 @@ export function applyGuardrails(raw: ModelSummary, articleText: string, existing
   chosen.codes.forEach((c) => codes.add(c));
 
   const data = storedSummarySchema.parse({
-    summary,
+    summary: cut.text,
     keyPoints,
     tags: chosen.tags.map((t) => t.name),
     kind: raw.kind,
     lowQuality: raw.lowQuality,
   });
-  return { data, tags: chosen.tags, codes: [...codes].sort() };
+  return { data, tags: chosen.tags, codes: [...codes].sort(), rejected: false };
 }

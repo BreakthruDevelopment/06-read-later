@@ -23,7 +23,8 @@ describe.skipIf(!url)("summaries (Postgres)", () => {
   const admin = { id: "sm-admin", role: "admin" as const };
   const rated = { id: "sm-rated", role: "user" as const };
   const capped = { id: "sm-capped", role: "user" as const };
-  const users = [alice, bob, admin, rated, capped];
+  const queuer = { id: "sm-queuer", role: "user" as const };
+  const users = [alice, bob, admin, rated, capped, queuer];
   const SECRET_PATH = "/private/path-with-token-9f8e7d";
   const SECRET_TITLE = "Unique secret title zebra";
   const SECRET_TEXT = "quokka-canary-sentence";
@@ -461,6 +462,95 @@ describe.skipIf(!url)("summaries (Postgres)", () => {
     expect(blob).toContain('"host":"logs.example"');
     expect(blob).toContain("url_stripped");
     for (const secret of [SECRET_TITLE, SECRET_TEXT, SECRET_PATH, "evil.example", "private/path"]) expect(blob).not.toContain(secret);
+  });
+
+  describe("a live-configured app never stores the recorded demo answer", () => {
+    const demoAnswer = {
+      summary: "Demo summary (recorded, not from a live model): the article explains how small teams ship reliable software by automating tests and deploys.",
+      keyPoints: ["Automated checks catch routine mistakes"],
+      tags: ["engineering", "devops"],
+      kind: "article",
+      lowQuality: false,
+    };
+    /** What generate() returns when the live provider failed and AI_FALLBACK_TO_DEMO is true. */
+    const fallbackDeps = () => {
+      const calls: Req[] = [];
+      const generate = (async (req: Req) => {
+        calls.push(req);
+        return { data: req.schema.parse(demoAnswer), provider: "demo", model: "recorded", demo: true, latencyMs: 1 };
+      }) as unknown as typeof Generate;
+      return { calls, deps: { generate } };
+    };
+
+    it("refunds both counters, creates no tags, stores no summary or hash, and retries; after the last attempt the link is summary_failed", async () => {
+      vi.stubEnv("AI_PROVIDER", "gemini");
+      vi.stubEnv("GEMINI_API_KEY", "test-key-not-real");
+      vi.stubEnv("AI_FALLBACK_TO_DEMO", "true");
+      resetEnvCache();
+      const daily = async () => (await sql`select count from daily_usage where day = (now() at time zone 'utc')::date and kind = 'summarize'`)[0]?.count ?? 0;
+      const rate = async () => (await sql`select count(*)::int as n from rate_event where user_id = ${alice.id} and kind = 'summarize'`)[0].n;
+      const [dailyBefore, rateBefore] = [await daily(), await rate()];
+      const tagsBefore = (await sql`select count(*)::int as n from tag where owner_id = ${alice.id}`)[0].n;
+
+      const id = await makeLink(alice);
+      const first = fallbackDeps();
+      const j = await runJob(alice, id, first.deps);
+      expect(first.calls).toHaveLength(1);
+      expect(j.status).toBe("queued");
+      expect(j.last_error).toBe("ai_failed");
+      expect(await summaryRow(id)).toBeUndefined();
+      expect(await tagsOf(id)).toEqual([]);
+      expect((await sql`select count(*)::int as n from tag where owner_id = ${alice.id} and name in ('engineering', 'devops')`)[0].n).toBe(0);
+      expect((await sql`select count(*)::int as n from tag where owner_id = ${alice.id}`)[0].n).toBe(tagsBefore);
+      expect(await daily()).toBe(dailyBefore);
+      expect(await rate()).toBe(rateBefore);
+      expect(await linkRow(id)).toMatchObject({ status: "summarizing" });
+
+      const last = await makeLink(alice);
+      const lastRun = await runJob(alice, last, fallbackDeps().deps, { maxAttempts: 1 });
+      expect(lastRun.status).toBe("failed");
+      expect(await linkRow(last)).toMatchObject({ status: "ready", fail_code: "summary_failed" });
+      expect(await summaryRow(last)).toBeUndefined();
+      expect(await daily()).toBe(dailyBefore);
+    });
+
+    it("still stores the recorded answer when the app is configured for demo, since that is the demo", async () => {
+      const id = await makeLink(alice);
+      await runJob(alice, id, fallbackDeps().deps);
+      expect((await summaryRow(id)).mode).toBe("demo");
+    });
+  });
+
+  it("stores nothing when every sentence of the summary is risky: the job fails for good and the link is summary_failed", async () => {
+    const id = await makeLink(alice);
+    const { calls, deps } = stub({
+      summary: "Sign in at paypal-verify.support to keep your account.",
+      keyPoints: ["Call 0800-555-0199 now"],
+      tags: ["finance", "urgent"],
+      kind: "article",
+      lowQuality: false,
+    });
+    const tagsBefore = (await sql`select count(*)::int as n from tag where owner_id = ${alice.id}`)[0].n;
+    const j = await runJob(alice, id, deps);
+    expect(calls).toHaveLength(1);
+    expect(j.status).toBe("failed");
+    expect(j.last_error).toBe("summary_rejected");
+    expect(await summaryRow(id)).toBeUndefined();
+    expect(await tagsOf(id)).toEqual([]);
+    expect((await sql`select count(*)::int as n from tag where owner_id = ${alice.id}`)[0].n).toBe(tagsBefore);
+    expect(await linkRow(id)).toMatchObject({ status: "ready", fail_code: "summary_failed" });
+  });
+
+  it("saving a bundled fixture counts against the queue caps like any other save", async () => {
+    const { saveLink } = await import("@/lib/links");
+    await sql`
+      insert into job (kind, owner_id, status, payload)
+      select 'fetch', ${queuer.id}, 'queued', '{}'::jsonb from generate_series(1, 50)
+    `;
+    await expect(saveLink(queuer, { url: "https://example.com/read-later/postgres-indexes" })).rejects.toMatchObject({ status: 429 });
+    const [{ n }] = await sql`select count(*)::int as n from link where owner_id = ${queuer.id}`;
+    expect(n).toBe(0);
+    await sql`delete from job where owner_id = ${queuer.id}`;
   });
 
   it("only the owner's id can write a summary: a job for someone else's link does nothing", async () => {
