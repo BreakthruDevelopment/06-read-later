@@ -46,6 +46,12 @@ function liveProvider(): AiProvider | null {
   return null;
 }
 
+/** True when `generate()` would call a real model (a provider is chosen and its key is set), not the demo fixtures. */
+export function isLiveProvider(): boolean {
+  const e = env();
+  return (e.AI_PROVIDER === "gemini" && !!e.GEMINI_API_KEY) || (e.AI_PROVIDER === "anthropic" && !!e.ANTHROPIC_API_KEY);
+}
+
 /** Models sometimes wrap JSON in code fences despite instructions. */
 export function extractJson(text: string): unknown {
   const trimmed = text.trim();

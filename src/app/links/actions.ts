@@ -8,8 +8,9 @@ import { ForbiddenError, UnauthorizedError } from "@/lib/auth/rbac";
 import { requireSameOrigin } from "@/lib/csrf";
 import { env } from "@/lib/env";
 import { HttpError } from "@/lib/errors";
-import { scheduleFetchKick } from "@/lib/jobs/schedule";
+import { scheduleFetchKick, scheduleKick } from "@/lib/jobs/schedule";
 import { deleteLink, patchLink, saveLink } from "@/lib/links";
+import { regenerateSummary } from "@/lib/summaries/run";
 
 export type LinkActionState = { error?: string; ok?: boolean; id?: string };
 
@@ -53,4 +54,18 @@ export async function deleteLinkAction(form: FormData): Promise<void> {
   const user = await requireUser();
   await deleteLink(user, String(form.get("id") ?? ""));
   revalidatePath("/dashboard");
+}
+
+/** Ask for a fresh summary (at most 3 per link). The owner only; anyone else gets "Link not found". */
+export async function regenerateSummaryAction(id: string): Promise<LinkActionState> {
+  try {
+    await sameOrigin();
+    const user = await requireUser();
+    await regenerateSummary(user, id);
+    scheduleKick();
+    revalidatePath("/dashboard");
+    return { ok: true, id };
+  } catch (err) {
+    return failure(err);
+  }
 }

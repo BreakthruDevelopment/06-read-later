@@ -87,14 +87,14 @@ describe.skipIf(!url)("links data layer (Postgres)", () => {
     expect(rest.links[0].id).not.toBe(page.links[0].id);
   });
 
-  it("stores a fixture article ready, with no fetch job, and search finds it only for the owner", async () => {
+  it("stores a fixture article with its text and a summarize job (no fetch job), and search finds it only for the owner", async () => {
     const { saveLink, listLinks } = await import("@/lib/links");
     const saved = await saveLink(alice, { url: "https://example.com/read-later/postgres-indexes" });
-    expect(saved.link.status).toBe("ready");
+    expect(saved.link.status).toBe("extracted");
     expect(saved.link.title).toMatch(/indexes/i);
     expect(saved.link.content?.paragraphs.length).toBeGreaterThan(0);
-    const [{ n }] = await sql`select count(*)::int as n from job where key = ${saved.link.id}`;
-    expect(n).toBe(0);
+    const jobs = await sql`select kind from job where key = ${saved.link.id}`;
+    expect(jobs.map((j) => j.kind)).toEqual(["summarize"]);
     const own = await listLinks(alice, { q: "indexes" });
     expect(own.links.some((link) => link.id === saved.link.id)).toBe(true);
     expect((await listLinks(bob, { q: "indexes" })).links).toHaveLength(0);
