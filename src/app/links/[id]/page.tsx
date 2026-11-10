@@ -96,7 +96,7 @@ export default async function ReaderPage({ params }: { params: Promise<{ id: str
           <ul className="mb-3 flex flex-wrap items-center gap-2 text-sm">
             {aiTags.map((tag) => (
               <li key={tag.id} className="inline-flex items-center gap-1">
-                <Link href={`/tags/${tag.name}`} className="font-semibold text-accent hover:underline">
+                <Link href={`/tags/${tag.name}`} className="inline-flex min-h-6 items-center font-semibold text-accent hover:underline">
                   {tag.name}
                 </Link>
                 <AiTagBadge />

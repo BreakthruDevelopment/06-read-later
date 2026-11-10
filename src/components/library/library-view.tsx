@@ -10,7 +10,10 @@ import { LinkList } from "./link-list";
 import { SaveLinkForm } from "./save-link-form";
 
 function listError(err: unknown): string {
-  if (err instanceof ZodError) return err.issues[0]?.message ?? "Invalid input";
+  if (err instanceof ZodError) {
+    if (err.issues[0]?.path[0] === "q") return "Search for 200 characters or fewer.";
+    return "Those filters aren't valid. Go back and try again.";
+  }
   if (err instanceof HttpError) return err.message;
   throw err;
 }

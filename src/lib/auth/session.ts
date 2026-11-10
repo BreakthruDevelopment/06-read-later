@@ -31,7 +31,6 @@ export async function requireUserOrRedirect(nextPath?: string): Promise<CurrentU
     const next = nextPath ? safeNext(nextPath) : "";
     redirect(next && next !== "/inbox" ? `/sign-in?next=${encodeURIComponent(next)}` : "/sign-in");
   }
-  nudge();
   return user;
 }
 
@@ -46,7 +45,6 @@ export async function requireRoleOrRedirect(role: Role): Promise<CurrentUser> {
 export async function requireUser(): Promise<CurrentUser> {
   const user = await getCurrentUser();
   if (!user) throw new UnauthorizedError();
-  nudge();
   return user;
 }
 

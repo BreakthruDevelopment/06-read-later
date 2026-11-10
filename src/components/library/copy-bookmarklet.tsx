@@ -1,11 +1,17 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { buttonPrimary, buttonSecondary, inputClass, labelClass } from "@/components/ui/styles";
 
 export function CopyBookmarklet({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // React 19 swaps a `javascript:` href for a throwing URL, so the anchor is rendered without one and the
+  // server-built bookmarklet is set after mount. Dragging it to the bookmarks bar then saves the real code.
+  const anchor = useRef<HTMLAnchorElement>(null);
+  useEffect(() => {
+    anchor.current?.setAttribute("href", value);
+  }, [value]);
 
   return (
     <div className="space-y-3">
@@ -30,7 +36,7 @@ export function CopyBookmarklet({ value }: { value: string }) {
         >
           {copied ? "Copied" : "Copy"}
         </button>
-        <a href={value} className={buttonSecondary}>
+        <a ref={anchor} data-bookmarklet className={buttonSecondary}>
           Read Later
         </a>
       </div>

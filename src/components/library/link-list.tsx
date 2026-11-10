@@ -49,7 +49,7 @@ export function LinkList({ links, empty }: { links: LinkView[]; empty: string })
           <span className="inline-flex flex-wrap justify-end gap-x-2 gap-y-1 sm:justify-start">
             {link.tags.map((tag) => (
               <span key={tag.id} className="inline-flex items-center gap-1">
-                <Link href={`/tags/${tag.name}`} className="text-accent hover:underline">
+                <Link href={`/tags/${tag.name}`} className="inline-flex min-h-6 items-center text-accent hover:underline">
                   {tag.name}
                 </Link>
                 {tag.source === "ai" && <AiTagBadge />}
