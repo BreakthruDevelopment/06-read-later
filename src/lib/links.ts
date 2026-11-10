@@ -5,7 +5,7 @@ import { type Actor, assertCan } from "@/lib/auth/rbac";
 import { db, schema } from "@/lib/db";
 import type { LinkContent, LinkStatus, TagSource } from "@/lib/db/schema";
 import { BadRequestError, ConflictError, HttpError, NotFoundError, TooManyRequestsError } from "@/lib/errors";
-import { enqueue } from "@/lib/jobs/queue";
+import { enqueue, retryJob } from "@/lib/jobs/queue";
 import { LIMITS } from "@/lib/limits";
 import { log } from "@/lib/log";
 import { ownedBy } from "@/lib/owned";
@@ -13,7 +13,7 @@ import { type Tx, advisoryLock, consumeRate } from "@/lib/usage";
 import { FIXTURES, fixtureByUrl, type FixtureArticle } from "@/lib/links/fixtures";
 import { normalizeUrl } from "@/lib/links/url";
 
-const { link, linkTag, tag, job, rateEvent } = schema;
+const { link, linkTag, linkSummary, tag, job, rateEvent } = schema;
 
 const TAG_NAME = /^[a-z0-9][a-z0-9-]{1,23}$/;
 
@@ -358,6 +358,111 @@ export async function deleteLink(actor: Actor, id: unknown): Promise<void> {
     return true;
   });
   if (!removed) throw new NotFoundError("Link not found");
+}
+
+export type SummaryView = {
+  summary: string;
+  keyPoints: string[];
+  lowQuality: boolean;
+  /** The stored JSON didn't match the summary shape. */
+  unavailable: boolean;
+};
+
+const summaryData = z.object({
+  summary: z.string().min(1).max(600),
+  keyPoints: z.array(z.string().max(200)).max(5).optional(),
+  lowQuality: z.boolean().optional(),
+});
+
+/** The owner's summary for a link, or null when none has been stored. 404 for anyone else. */
+export async function getLinkSummary(actor: Actor, id: unknown): Promise<SummaryView | null> {
+  assertCan(actor, "read", { ownerId: actor.id });
+  const linkId = parseId(id);
+  const [owned] = await db().select({ id: link.id }).from(link).where(ownedBy(link, actor, eq(link.id, linkId))).limit(1);
+  if (!owned) throw new NotFoundError("Link not found");
+  const [summary] = await db()
+    .select({ data: linkSummary.data })
+    .from(linkSummary)
+    .where(and(eq(linkSummary.linkId, linkId), eq(linkSummary.ownerId, actor.id)))
+    .limit(1);
+  if (!summary) return null;
+  const parsed = summaryData.safeParse(summary.data);
+  if (!parsed.success) return { summary: "Summary unavailable", keyPoints: [], lowQuality: false, unavailable: true };
+  return {
+    summary: parsed.data.summary,
+    keyPoints: (parsed.data.keyPoints ?? []).filter((point) => point.length > 0),
+    lowQuality: parsed.data.lowQuality ?? false,
+    unavailable: false,
+  };
+}
+
+function payloadRecord(value: unknown): Record<string, unknown> {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) return value as Record<string, unknown>;
+  return {};
+}
+
+function manualRetriesToday(payload: Record<string, unknown>, day: string): number {
+  if (payload.manualRetryDay !== day) return 0;
+  const count = payload.manualRetries;
+  return typeof count === "number" && Number.isFinite(count) && count > 0 ? count : 0;
+}
+
+/**
+ * Queue a failed link again. Three manual retries per link per UTC day, counted on the
+ * fetch job: the rate ledger has no link id. 404 for anyone except the owner.
+ */
+export async function retryLink(actor: Actor, id: unknown): Promise<LinkView> {
+  assertCan(actor, "update", { ownerId: actor.id });
+  const linkId = parseId(id);
+  const updated = await db().transaction(async (tx) => {
+    await advisoryLock(tx, `retry:${linkId}`);
+    const [current] = await tx.select().from(link).where(ownedBy(link, actor, eq(link.id, linkId))).limit(1);
+    if (!current) throw new NotFoundError("Link not found");
+    if (current.status !== "failed") throw new ConflictError("Only a failed link can be retried.");
+
+    const [existingJob] = await tx
+      .select({ id: job.id, status: job.status, payload: job.payload })
+      .from(job)
+      .where(and(eq(job.kind, "fetch"), eq(job.key, linkId), eq(job.ownerId, actor.id)))
+      .orderBy(desc(job.createdAt))
+      .limit(1);
+
+    if (existingJob && (existingJob.status === "queued" || existingJob.status === "running")) {
+      const [row] = await tx
+        .update(link)
+        .set({ status: "queued", failCode: null, updatedAt: sql`now()` })
+        .where(ownedBy(link, actor, eq(link.id, linkId)))
+        .returning();
+      if (!row) throw new NotFoundError("Link not found");
+      return row;
+    }
+
+    const [dayRow] = await tx.execute<{ day: string }>(sql`select to_char((now() at time zone 'utc')::date, 'YYYY-MM-DD') as day`);
+    const day = dayRow?.day ?? new Date().toISOString().slice(0, 10);
+    const payload = payloadRecord(existingJob?.payload);
+    const used = manualRetriesToday(payload, day);
+    if (used >= LIMITS.retriesPerLinkPerDay) throw new TooManyRequestsError("You can retry this link 3 times a day.");
+    await assertQueueRoom(tx, actor.id);
+
+    const nextPayload = { ...payload, linkId, manualRetryDay: day, manualRetries: used + 1 };
+    const [row] = await tx
+      .update(link)
+      .set({ status: "queued", failCode: null, updatedAt: sql`now()` })
+      .where(ownedBy(link, actor, eq(link.id, linkId)))
+      .returning();
+    if (!row) throw new NotFoundError("Link not found");
+
+    if (existingJob && existingJob.status === "failed") {
+      const outcome = await retryJob(tx, { id: existingJob.id }, { ownerId: actor.id });
+      if (outcome !== "retried") throw new ConflictError("That link is already being fetched.");
+      await tx.update(job).set({ payload: nextPayload, updatedAt: sql`now()` }).where(eq(job.id, existingJob.id));
+    } else {
+      await enqueue(tx, { kind: "fetch", key: linkId, ownerId: actor.id, payload: nextPayload });
+    }
+    return row;
+  });
+  log.info("link.retry", { host: updated.host });
+  return oneView(updated);
 }
 
 export async function listTags(actor: Actor): Promise<{ id: string; name: string; count: number }[]> {

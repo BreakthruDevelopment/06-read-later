@@ -16,8 +16,7 @@ export async function loadDemoAction(_prev: DemoState, _form: FormData): Promise
     requireSameOrigin(new Request(env().APP_URL, { headers: await headers() }));
     const user = await requireRole("admin");
     const result = await loadDemoWorkspace(user);
-    revalidatePath("/admin");
-    revalidatePath("/dashboard");
+    revalidatePath("/", "layout");
     return { ok: true, links: result.links };
   } catch (err) {
     if (err instanceof HttpError) return { error: err.message };

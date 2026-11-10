@@ -63,7 +63,7 @@ export async function AppShell({ children, nav }: { children: ReactNode; nav?: R
             <span className="truncate font-sans text-lg font-semibold tracking-tight sm:text-xl">{APP_TITLE}</span>
           </Link>
 
-          <div className="flex flex-1 items-center sm:ml-auto sm:flex-none">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center sm:ml-auto sm:flex-none">
             {nav ?? <NavLinks links={links} />}
           </div>
 
